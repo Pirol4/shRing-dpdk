@@ -204,6 +204,13 @@ struct mlx5_devx_wq_attr {
 	uint64_t wq_umem_offset;
 };
 
+struct mlx5_devx_create_rmp_attr {
+	uint32_t state:4;
+	uint32_t basic_cyclic_rcv_wqe:1;
+	struct mlx5_devx_wq_attr wq_attr;
+};
+
+
 /* Create RQ attributes structure, used by create RQ operation. */
 struct mlx5_devx_create_rq_attr {
 	uint32_t rlky:1;
@@ -503,6 +510,10 @@ int mlx5_devx_get_out_command_status(void *out);
 __rte_internal
 int mlx5_devx_cmd_qp_query_tis_td(void *qp, uint32_t tis_num,
 				  uint32_t *tis_td);
+__rte_internal
+struct mlx5_devx_obj *mlx5_devx_cmd_create_rmp(void *ctx,
+				       struct mlx5_devx_create_rmp_attr *rmp_attr,
+				       int socket);
 __rte_internal
 struct mlx5_devx_obj *mlx5_devx_cmd_create_rq(void *ctx,
 				       struct mlx5_devx_create_rq_attr *rq_attr,

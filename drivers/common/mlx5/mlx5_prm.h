@@ -1040,6 +1040,10 @@ enum {
 	MLX5_CMD_OP_CREATE_RQ = 0x908,
 	MLX5_CMD_OP_MODIFY_RQ = 0x909,
 	MLX5_CMD_OP_QUERY_RQ = 0x90b,
+	MLX5_CMD_OP_CREATE_RMP = 0x90c,
+	MLX5_CMD_OP_MODIFY_RMP = 0x90d,
+	MLX5_CMD_OP_DESTROY_RMP = 0x90e,
+	MLX5_CMD_OP_QUERY_RMP = 0x90f,
 	MLX5_CMD_OP_CREATE_TIS = 0x912,
 	MLX5_CMD_OP_QUERY_TIS = 0x915,
 	MLX5_CMD_OP_CREATE_RQT = 0x916,
@@ -1532,7 +1536,8 @@ struct mlx5_ifc_cmd_hca_cap_bits {
 	u8 reserved_at_378[0x3];
 	u8 log_max_tis[0x5];
 	u8 basic_cyclic_rcv_wqe[0x1];
-	u8 reserved_at_381[0x2];
+	u8 reserved_at_382[0x1];
+	u8 mem_rq_rmp[0x1];
 	u8 log_max_rmp[0x5];
 	u8 reserved_at_388[0x3];
 	u8 log_max_rqt[0x5];
@@ -2048,6 +2053,17 @@ enum {
 	MLX5_RQC_STATE_ERR  = 0x3,
 };
 
+enum {
+	MLX5_RMPC_STATE_RST  = 0x0,
+	MLX5_RMPC_STATE_RDY  = 0x1,
+	MLX5_RMPC_STATE_ERR  = 0x3,
+};
+
+enum {
+	MLX5_RMPC_BASIC_CYCLIC_WQE_ALWAYS  = 0x0,
+	MLX5_RMPC_BASIC_CYCLIC_WQE_SIG_ONLY  = 0x1,
+};
+
 struct mlx5_ifc_rqc_bits {
 	u8 rlky[0x1];
 	u8 delay_drop_en[0x1];
@@ -2075,6 +2091,118 @@ struct mlx5_ifc_rqc_bits {
 	u8 hairpin_peer_vhca[0x10];
 	u8 reserved_at_e0[0xa0];
 	struct mlx5_ifc_wq_bits wq; /* Not used in LRO RQ. */
+};
+
+struct mlx5_ifc_rmpc_bits {
+	uint8_t    reserved_at_0[0x8];
+	uint8_t    state[0x4];
+	uint8_t    reserved_at_c[0x14];
+
+	uint8_t    basic_cyclic_rcv_wqe[0x1];
+	uint8_t    reserved_at_21[0x1f];
+
+	uint8_t    reserved_at_40[0x140];
+
+	struct mlx5_ifc_wq_bits wq;
+};
+
+struct mlx5_ifc_create_rmp_in_bits {
+    uint8_t    opcode[0x10];
+    uint8_t    uid[0x10];
+
+    uint8_t    reserved_at_20[0x10];
+    uint8_t    op_mod[0x10];
+
+    uint8_t    reserved_at_40[0xc0];
+
+    struct mlx5_ifc_rmpc_bits ctx;
+};
+
+struct mlx5_ifc_create_rmp_out_bits {
+    uint8_t    status[0x8];
+    uint8_t    reserved_at_8[0x18];
+
+    uint8_t    syndrome[0x20];
+
+    uint8_t    reserved_at_40[0x8];
+    uint8_t    rmpn[0x18];
+
+    uint8_t    reserved_at_60[0x20];
+};
+
+struct mlx5_ifc_destroy_rmp_in_bits {
+    uint8_t    opcode[0x10];
+    uint8_t    uid[0x10];
+
+    uint8_t    reserved_at_20[0x10];
+    uint8_t    op_mod[0x10];
+
+    uint8_t    reserved_at_40[0x8];
+    uint8_t    rmpn[0x18];
+
+    uint8_t    reserved_at_60[0x20];
+};
+
+struct mlx5_ifc_destroy_rmp_out_bits {
+    uint8_t    status[0x8];
+    uint8_t    reserved_at_8[0x18];
+
+    uint8_t    syndrome[0x20];
+
+    uint8_t    reserved_at_40[0x40];
+};
+
+struct mlx5_ifc_modify_rmp_in_bits {
+    uint8_t    opcode[0x10];
+    uint8_t    uid[0x10];
+
+    uint8_t    reserved_at_20[0x10];
+    uint8_t    op_mod[0x10];
+
+    uint8_t    rmp_state[0x4];
+    uint8_t    reserved_at_44[0x4];
+    uint8_t    rmpn[0x18];
+
+    uint8_t    reserved_at_60[0x20];
+
+    uint8_t    modify_bitmask[0x40];
+
+    uint8_t    reserved_at_c0[0x40];
+
+    struct mlx5_ifc_rmpc_bits ctx;
+};
+
+struct mlx5_ifc_modify_rmp_out_bits {
+    uint8_t    status[0x8];
+    uint8_t    reserved_at_8[0x18];
+
+    uint8_t    syndrome[0x20];
+
+    uint8_t    reserved_at_40[0x40];
+};
+
+struct mlx5_ifc_query_rmp_in_bits {
+    uint8_t    opcode[0x10];
+    uint8_t    uid[0x10];
+
+    uint8_t    reserved_at_20[0x10];
+    uint8_t    op_mod[0x10];
+
+    uint8_t    reserved_at_40[0x8];
+    uint8_t    rmpn[0x18];
+
+    uint8_t    reserved_at_60[0x20];
+};
+
+struct mlx5_ifc_query_rmp_out_bits {
+    uint8_t    status[0x8];
+    uint8_t    reserved_at_8[0x18];
+
+    uint8_t    syndrome[0x20];
+
+    uint8_t    reserved_at_40[0xc0];
+
+    struct mlx5_ifc_rmpc_bits rmp_context;
 };
 
 struct mlx5_ifc_create_rq_out_bits {

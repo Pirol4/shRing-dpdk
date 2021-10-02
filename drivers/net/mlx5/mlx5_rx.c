@@ -344,7 +344,21 @@ mlx5_rxq_initialize(struct mlx5_rxq_data *rxq)
 		uintptr_t addr;
 		uint32_t byte_count;
 
-		if (mlx5_rxq_mprq_enabled(rxq)) {
+		if (rxq->rmp) {
+			struct mlx5_mprq_buf *buf = (*rxq->mprq_bufs)[i];
+			volatile struct mlx5_wqe_srq_next_seg *next;
+
+			next = &((volatile struct mlx5_wqe_mprq *)
+				rxq->wqes)[i].next_seg;
+			next->next_wqe_index = htons((i + 1) % wqe_n);
+
+			scat = &((volatile struct mlx5_wqe_mprq *)
+				rxq->wqes)[i].dseg;
+			addr = (uintptr_t)mlx5_mprq_buf_addr(buf,
+							 1 << rxq->strd_num_n);
+			byte_count = (1 << rxq->strd_sz_n) *
+					(1 << rxq->strd_num_n);
+		} else if (mlx5_rxq_mprq_enabled(rxq)) {
 			struct mlx5_mprq_buf *buf = (*rxq->mprq_bufs)[i];
 
 			scat = &((volatile struct mlx5_wqe_mprq *)

@@ -272,6 +272,7 @@ struct mlx5_dev_config {
 	int tx_skew; /* Tx scheduling skew between WQE and data on wire. */
 	struct mlx5_hca_attr hca_attr; /* HCA attributes. */
 	struct mlx5_lro_config lro; /* LRO configuration. */
+	int rmp_en;
 };
 
 
@@ -1271,6 +1272,7 @@ enum mlx5_txq_modify_type {
 /* HW objects operations structure. */
 struct mlx5_obj_ops {
 	int (*rxq_obj_modify_vlan_strip)(struct mlx5_rxq_obj *rxq_obj, int on);
+	int (*rmp_obj_new)(struct rte_eth_dev *dev, uint16_t idx);
 	int (*rxq_obj_new)(struct rte_eth_dev *dev, uint16_t idx);
 	int (*rxq_event_get)(struct mlx5_rxq_obj *rxq_obj);
 	int (*rxq_obj_modify)(struct mlx5_rxq_obj *rxq_obj, uint8_t type);

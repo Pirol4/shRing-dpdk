@@ -103,6 +103,7 @@ struct mlx5_rxq_data {
 	unsigned int lro:1; /* Enable LRO. */
 	unsigned int dynf_meta:1; /* Dynamic metadata is configured. */
 	unsigned int mcqe_format:3; /* CQE compression format. */
+	unsigned int rmp:1; /* CQE compression format. */
 	volatile uint32_t *rq_db;
 	volatile uint32_t *cq_db;
 	uint16_t port_id;
@@ -543,6 +544,12 @@ mlx5_check_mprq_support(struct rte_eth_dev *dev)
 	    priv->rxqs_n >= priv->config.mprq.min_rxqs_num)
 		return 1;
 	return -ENOTSUP;
+}
+
+static __rte_always_inline int
+mlx5_rxq_rmp_enabled(struct mlx5_rxq_data *rxq)
+{
+	return rxq->rmp > 0;
 }
 
 /**

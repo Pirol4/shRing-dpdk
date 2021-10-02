@@ -1190,6 +1190,7 @@ mlx5_txq_ibv_obj_release(struct mlx5_txq_obj *txq_obj)
 
 struct mlx5_obj_ops ibv_obj_ops = {
 	.rxq_obj_modify_vlan_strip = mlx5_rxq_obj_modify_wq_vlan_strip,
+	.rmp_obj_new = NULL,
 	.rxq_obj_new = mlx5_rxq_ibv_obj_new,
 	.rxq_event_get = mlx5_rx_ibv_get_event,
 	.rxq_obj_modify = mlx5_ibv_modify_wq,

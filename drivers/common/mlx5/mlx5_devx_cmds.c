@@ -762,6 +762,9 @@ mlx5_devx_cmd_query_hca_attr(void *ctx,
 		return -1;
 	}
 	hcattr = MLX5_ADDR_OF(query_hca_cap_out, out, capability);
+	printf("mem_rq_rmp  %d max num of rmps %d\n", 
+			MLX5_GET(cmd_hca_cap, hcattr, mem_rq_rmp),
+			MLX5_GET(cmd_hca_cap, hcattr, log_max_rmp));
 	attr->flow_counter_bulk_alloc_bitmap =
 			MLX5_GET(cmd_hca_cap, hcattr, flow_counter_bulk_alloc);
 	attr->flow_counters_dump = MLX5_GET(cmd_hca_cap, hcattr,
@@ -970,6 +973,8 @@ mlx5_devx_cmd_query_hca_attr(void *ctx,
 		return -1;
 	}
 	hcattr = MLX5_ADDR_OF(query_hca_cap_out, out, capability);
+
+
 	attr->wqe_vlan_insert = MLX5_GET(per_protocol_networking_offload_caps,
 					 hcattr, wqe_vlan_insert);
 	attr->csum_cap = MLX5_GET(per_protocol_networking_offload_caps,
@@ -1129,6 +1134,57 @@ devx_cmd_fill_wq_data(void *wq_ctx, struct mlx5_devx_wq_attr *wq_attr)
 }
 
 /**
+ * Create RMP using DevX API.
+ *
+ * @param[in] ctx
+ *   Context returned from mlx5 open_device() glue function.
+ * @param [in] rq_attr
+ *   Pointer to create RMP attributes structure.
+ * @param [in] socket
+ *   CPU socket ID for allocations.
+ *
+ * @return
+ *   The DevX object created, NULL otherwise and rte_errno is set.
+ */
+struct mlx5_devx_obj *
+mlx5_devx_cmd_create_rmp(void *ctx,
+			 struct mlx5_devx_create_rmp_attr *rmp_attr,
+			 int socket)
+{
+	uint32_t in[MLX5_ST_SZ_DW(create_rmp_in)] = {0};
+	uint32_t out[MLX5_ST_SZ_DW(create_rmp_out)] = {0};
+	void *rmp_ctx, *wq_ctx;
+	struct mlx5_devx_wq_attr *wq_attr;
+	struct mlx5_devx_obj *rmp = NULL;
+
+	rmp = mlx5_malloc(MLX5_MEM_ZERO, sizeof(*rmp), 0, socket);
+	if (!rmp) {
+		DRV_LOG(ERR, "Failed to allocate RMP data");
+		rte_errno = ENOMEM;
+		return NULL;
+	}
+	MLX5_SET(create_rmp_in, in, opcode, MLX5_CMD_OP_CREATE_RMP);
+	rmp_ctx = MLX5_ADDR_OF(create_rmp_in, in, ctx);
+	MLX5_SET(rmpc, rmp_ctx, state, rmp_attr->state);
+	MLX5_SET(rmpc, rmp_ctx, basic_cyclic_rcv_wqe, rmp_attr->basic_cyclic_rcv_wqe);
+	wq_ctx = MLX5_ADDR_OF(rmpc, rmp_ctx, wq);
+	wq_attr = &rmp_attr->wq_attr;
+	devx_cmd_fill_wq_data(wq_ctx, wq_attr);
+	rmp->obj = mlx5_glue->devx_obj_create(ctx, in, sizeof(in),
+						  out, sizeof(out));
+	if (!rmp->obj) {
+		DRV_LOG(ERR, "Failed to create RMP using DevX. errno %d", errno);
+		printf("Failed to create RMP using DevX. errno %d", errno);
+		rte_errno = errno;
+		mlx5_free(rmp);
+		return NULL;
+	}
+	rmp->id = MLX5_GET(create_rmp_out, out, rmpn);
+	printf("!!!! creating RMP %d\n",rmp->id);
+	return rmp;
+}
+
+/**
  * Create RQ using DevX API.
  *
  * @param[in] ctx
@@ -1179,12 +1235,13 @@ mlx5_devx_cmd_create_rq(void *ctx,
 	rq->obj = mlx5_glue->devx_obj_create(ctx, in, sizeof(in),
 						  out, sizeof(out));
 	if (!rq->obj) {
-		DRV_LOG(ERR, "Failed to create RQ using DevX");
+		DRV_LOG(ERR, "Failed to create RQ using DevX %d", errno);
 		rte_errno = errno;
 		mlx5_free(rq);
 		return NULL;
 	}
 	rq->id = MLX5_GET(create_rq_out, out, rqn);
+	printf("!!!! creating RQ %d\n",rq->id);
 	return rq;
 }
 

@@ -240,6 +240,7 @@ mlx5_rxq_create_devx_rq_resources(struct rte_eth_dev *dev, uint16_t idx)
 	struct mlx5_rxq_ctrl *rxq_ctrl =
 		container_of(rxq_data, struct mlx5_rxq_ctrl, rxq);
 	struct mlx5_devx_create_rq_attr rq_attr = { 0 };
+	struct mlx5_devx_create_rmp_attr rmp_attr = { 0 };
 	uint16_t log_desc_n = rxq_data->elts_n - rxq_data->sges_n;
 	uint32_t wqe_size, log_wqe_size;
 
@@ -250,7 +251,23 @@ mlx5_rxq_create_devx_rq_resources(struct rte_eth_dev *dev, uint16_t idx)
 	rq_attr.cqn = rxq_ctrl->obj->cq_obj.cq->id;
 	rq_attr.scatter_fcs = (rxq_data->crc_present) ? 1 : 0;
 	/* Fill WQ attributes for this RQ. */
-	if (mlx5_rxq_mprq_enabled(rxq_data)) {
+	if (priv->config.rmp_en) {
+		rxq_data->rmp = 1;
+		rq_attr.wq_attr.wq_type = MLX5_WQ_TYPE_LINKED_LIST_STRIDING_RQ;
+		/*
+		 * Number of strides in each WQE:
+		 * 512*2^single_wqe_log_num_of_strides.
+		 */
+		rq_attr.wq_attr.single_wqe_log_num_of_strides =
+				rxq_data->strd_num_n -
+				MLX5_MIN_SINGLE_WQE_LOG_NUM_STRIDES;
+		/* Stride size = (2^single_stride_log_num_of_bytes)*64B. */
+		rq_attr.wq_attr.single_stride_log_num_of_bytes =
+				rxq_data->strd_sz_n -
+				MLX5_MIN_SINGLE_STRIDE_LOG_NUM_BYTES;
+		wqe_size = sizeof(struct mlx5_wqe_mprq);
+		printf("Using linked list striding rq\n");
+	} else if (mlx5_rxq_mprq_enabled(rxq_data)) {
 		rq_attr.wq_attr.wq_type = MLX5_WQ_TYPE_CYCLIC_STRIDING_RQ;
 		/*
 		 * Number of strides in each WQE:
@@ -277,9 +294,16 @@ mlx5_rxq_create_devx_rq_resources(struct rte_eth_dev *dev, uint16_t idx)
 						MLX5_WQ_END_PAD_MODE_NONE;
 	rq_attr.wq_attr.pd = priv->sh->pdn;
 	rq_attr.counter_set_id = priv->counter_set_id;
+
+	/* Create RMP object with DevX. */
+	if (priv->config.rmp_en) {
+		rmp_attr.state = MLX5_RQC_STATE_RDY;
+		rmp_attr.basic_cyclic_rcv_wqe = MLX5_RMPC_BASIC_CYCLIC_WQE_ALWAYS;
+	}
+
 	/* Create RQ using DevX API. */
 	return mlx5_devx_rq_create(priv->sh->ctx, &rxq_ctrl->obj->rq_obj,
-				   wqe_size, log_desc_n, &rq_attr,
+				   wqe_size, log_desc_n, &rq_attr, &rmp_attr,
 				   rxq_ctrl->socket);
 }
 

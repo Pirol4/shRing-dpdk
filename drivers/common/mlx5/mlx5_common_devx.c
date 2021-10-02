@@ -321,9 +321,11 @@ mlx5_devx_rq_destroy(struct mlx5_devx_rq *rq)
 int
 mlx5_devx_rq_create(void *ctx, struct mlx5_devx_rq *rq_obj, uint32_t wqe_size,
 		    uint16_t log_wqbb_n,
-		    struct mlx5_devx_create_rq_attr *attr, int socket)
+		    struct mlx5_devx_create_rq_attr *attr,
+		    struct mlx5_devx_create_rmp_attr *rmp_attr,
+		    int socket)
 {
-	struct mlx5_devx_obj *rq = NULL;
+	struct mlx5_devx_obj *rq = NULL, *rmp = NULL;
 	struct mlx5dv_devx_umem *umem_obj = NULL;
 	void *umem_buf = NULL;
 	size_t alignment = MLX5_WQE_BUF_ALIGNMENT;
@@ -363,6 +365,23 @@ mlx5_devx_rq_create(void *ctx, struct mlx5_devx_rq *rq_obj, uint32_t wqe_size,
 	attr->wq_attr.dbr_umem_id = attr->wq_attr.wq_umem_id;
 	attr->wq_attr.dbr_addr = umem_dbrec;
 	attr->wq_attr.log_wq_pg_sz = MLX5_LOG_PAGE_SIZE;
+
+	if (rmp_attr->state != MLX5_RQC_STATE_RST) {
+		/* Create receive queue object with DevX. */
+		rmp_attr->wq_attr = attr->wq_attr;
+		printf("log_wq_stride %d %d\n", // must be at least 5
+				rmp_attr->wq_attr.log_wq_stride,
+				attr->wq_attr.log_wq_stride);
+
+		rmp = mlx5_devx_cmd_create_rmp(ctx, rmp_attr, socket);
+		if (!rmp) {
+			DRV_LOG(ERR, "Can't create DevX RMP object %d", errno);
+			rte_errno = ENOMEM;
+			goto error;
+		}
+		attr->rmpn = rmp->id;
+	}
+
 	/* Create receive queue object with DevX. */
 	rq = mlx5_devx_cmd_create_rq(ctx, attr, socket);
 	if (!rq) {
@@ -370,6 +389,8 @@ mlx5_devx_rq_create(void *ctx, struct mlx5_devx_rq *rq_obj, uint32_t wqe_size,
 		rte_errno = ENOMEM;
 		goto error;
 	}
+
+	rq_obj->rmp = rmp;
 	rq_obj->umem_buf = umem_buf;
 	rq_obj->umem_obj = umem_obj;
 	rq_obj->rq = rq;
@@ -381,6 +402,9 @@ error:
 		claim_zero(mlx5_os_umem_dereg(umem_obj));
 	if (umem_buf)
 		mlx5_free((void *)(uintptr_t)umem_buf);
+	/* TODO */
+	// if (rmp)
+	// 	mlx5_devx_rmp_destroy(rmp);
 	rte_errno = ret;
 	return -rte_errno;
 }

@@ -28,6 +28,7 @@ INTERNAL {
 	mlx5_devx_cmd_create_qp;
 	mlx5_devx_cmd_create_rq;
 	mlx5_devx_cmd_create_rqt;
+	mlx5_devx_cmd_create_rmp;
 	mlx5_devx_cmd_create_sq;
 	mlx5_devx_cmd_create_td;
 	mlx5_devx_cmd_create_tir;

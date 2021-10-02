@@ -116,6 +116,11 @@
 #define MLX5_TX_PP "tx_pp"
 
 /*
+ * Receive memory pool enabled.
+ */
+#define MLX5_RMP_EN "rmp_en"
+
+/*
  * Device parameter to specify skew in nanoseconds on Tx datapath,
  * it represents the time between SQ start WQE processing and
  * appearing actual packet data on the wire.
@@ -1844,6 +1849,8 @@ mlx5_args_check(const char *key, const char *val, void *opaque)
 		}
 		config->cqe_comp = !!tmp;
 		config->cqe_comp_fmt = tmp;
+	} else if (strcmp(MLX5_RMP_EN, key) == 0) {
+		config->rmp_en = !!tmp;
 	} else if (strcmp(MLX5_RXQ_PKT_PAD_EN, key) == 0) {
 		config->hw_padding = !!tmp;
 	} else if (strcmp(MLX5_RX_MPRQ_EN, key) == 0) {
@@ -2007,6 +2014,7 @@ mlx5_args(struct mlx5_dev_config *config, struct rte_devargs *devargs)
 		MLX5_RECLAIM_MEM,
 		MLX5_SYS_MEM_EN,
 		MLX5_DECAP_EN,
+		MLX5_RMP_EN,
 		NULL,
 	};
 	struct rte_kvargs *kvlist;
