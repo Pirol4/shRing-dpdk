@@ -1141,6 +1141,8 @@ mlx5_rx_burst_mprq(void *dpdk_rxq, struct rte_mbuf **pkts, uint16_t pkts_n)
 				break;
 			}
 		}
+		printf("%s ci %d cons_strd %d/%d len %d\n",
+			__func__, rq_ci, consumed_strd, strd_n, len);
 		rxq_cq_to_mbuf(rxq, pkt, cqe, mcqe);
 		if (cqe->lro_num_seg > 1) {
 			mlx5_lro_update_hdr(rte_pktmbuf_mtod(pkt, uint8_t *),
