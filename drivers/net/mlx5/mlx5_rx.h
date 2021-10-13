@@ -9,6 +9,7 @@
 #include <stdint.h>
 #include <sys/queue.h>
 
+#include <rte_atomic.h>
 #include <rte_mbuf.h>
 #include <rte_mempool.h>
 #include <rte_common.h>
@@ -140,6 +141,7 @@ struct mlx5_rxq_data {
 	rte_spinlock_t *uar_lock_cq;
 	/* CQ (UAR) access lock required for 32bit implementations */
 #endif
+	int head;
 	uint32_t tunnel; /* Tunnel information. */
 	int timestamp_offset; /* Dynamic mbuf field for timestamp. */
 	uint64_t timestamp_rx_flag; /* Dynamic mbuf flag for timestamp. */
@@ -256,6 +258,8 @@ void mlx5_mprq_buf_free_cb(void *addr, void *opaque);
 void mlx5_mprq_buf_free(struct mlx5_mprq_buf *buf);
 uint16_t mlx5_rx_burst_mprq(void *dpdk_rxq, struct rte_mbuf **pkts,
 			    uint16_t pkts_n);
+uint16_t mlx5_rx_burst_rmp_mprq(void *dpdk_rxq, struct rte_mbuf **pkts,
+				uint16_t pkts_n);
 uint16_t removed_rx_burst(void *dpdk_rxq, struct rte_mbuf **pkts,
 			  uint16_t pkts_n);
 int mlx5_rx_descriptor_status(void *rx_queue, uint16_t offset);
@@ -361,6 +365,62 @@ mprq_buf_replace(struct mlx5_rxq_data *rxq, uint16_t rq_idx)
 	struct mlx5_mprq_buf *buf = (*rxq->mprq_bufs)[rq_idx];
 	void *addr;
 
+	if (__atomic_load_n(&buf->refcnt, __ATOMIC_RELAXED) > 1) {
+		MLX5_ASSERT(rep != NULL);
+		/* Replace MPRQ buf. */
+		(*rxq->mprq_bufs)[rq_idx] = rep;
+		/* Replace WQE. */
+		addr = mlx5_mprq_buf_addr(rep, strd_n);
+		wqe->addr = rte_cpu_to_be_64((uintptr_t)addr);
+		/* If there's only one MR, no need to replace LKey in WQE. */
+		if (unlikely(mlx5_mr_btree_len(&rxq->mr_ctrl.cache_bh) > 1))
+			wqe->lkey = mlx5_rx_addr2mr(rxq, (uintptr_t)addr);
+		/* Stash a mbuf for next replacement. */
+		if (likely(!rte_mempool_get(rxq->mprq_mp, (void **)&rep)))
+			rxq->mprq_repl = rep;
+		else
+			rxq->mprq_repl = NULL;
+		/* Release the old buffer. */
+		mlx5_mprq_buf_free(buf);
+		printf("slow-path %s\n", __func__);
+	} else if (unlikely(rxq->mprq_repl == NULL)) {
+		struct mlx5_mprq_buf *rep;
+
+		/*
+		 * Currently, the MPRQ mempool is out of buffer
+		 * and doing memcpy regardless of the size of Rx
+		 * packet. Retry allocation to get back to
+		 * normal.
+		 */
+		if (!rte_mempool_get(rxq->mprq_mp, (void **)&rep))
+			rxq->mprq_repl = rep;
+	} else {
+		printf("fast-path %s\n", __func__);
+	}
+}
+
+static __rte_always_inline void
+rmp_mprq_buf_replace(struct mlx5_rxq_data *rxq, uint16_t rq_idx)
+{
+	const uint32_t wq_mask = (1 << rxq->elts_n) - 1;
+	const uint32_t strd_n = 1 << rxq->strd_num_n;
+	struct mlx5_mprq_buf *rep = rxq->mprq_repl;
+	volatile struct mlx5_wqe_data_seg *wqe;
+	volatile struct mlx5_wqe_srq_next_seg *next;
+	struct mlx5_mprq_buf *buf = (*rxq->mprq_bufs)[rq_idx];
+	int next_idx = rxq->head;
+	void *addr;
+
+	while (!__atomic_compare_exchange_n(&rxq->head, &next_idx, rq_idx, 0,
+					    __ATOMIC_ACQUIRE,
+					    __ATOMIC_RELAXED)) {
+		next_idx = rxq->head;
+	}
+	wqe = &((volatile struct mlx5_wqe_mprq *)rxq->wqes)[next_idx].dseg;
+	next = &((volatile struct mlx5_wqe_mprq *)rxq->wqes)[next_idx].next_seg;
+	next->next_wqe_index = htons(rq_idx & wq_mask);
+
+	// TODO: remove all but slow-path?
 	if (__atomic_load_n(&buf->refcnt, __ATOMIC_RELAXED) > 1) {
 		MLX5_ASSERT(rep != NULL);
 		/* Replace MPRQ buf. */
@@ -546,6 +606,25 @@ mlx5_check_mprq_support(struct rte_eth_dev *dev)
 	return -ENOTSUP;
 }
 
+/**
+ * Check whether RMP can be enabled for the device.
+ *
+ * @param dev
+ *   Pointer to Ethernet device.
+ *
+ * @return
+ *   1 if supported, negative errno value if not.
+ */
+static __rte_always_inline int
+mlx5_check_rmp_support(struct rte_eth_dev *dev)
+{
+	struct mlx5_priv *priv = dev->data->dev_private;
+
+	if (priv->config.rmp_en)
+		return 1;
+	return -ENOTSUP;
+}
+
 static __rte_always_inline int
 mlx5_rxq_rmp_enabled(struct mlx5_rxq_data *rxq)
 {
@@ -596,6 +675,42 @@ mlx5_mprq_enabled(struct rte_eth_dev *dev)
 			continue;
 		n_ibv++;
 		if (mlx5_rxq_mprq_enabled(rxq))
+			++n;
+	}
+	/* Multi-Packet RQ can't be partially configured. */
+	MLX5_ASSERT(n == 0 || n == n_ibv);
+	return n == n_ibv;
+}
+
+/**
+ * Check whether RMP RQ is enabled for the device.
+ *
+ * @param dev
+ *   Pointer to Ethernet device.
+ *
+ * @return
+ *   0 if disabled, otherwise enabled.
+ */
+static __rte_always_inline int
+mlx5_rmp_enabled(struct rte_eth_dev *dev)
+{
+	struct mlx5_priv *priv = dev->data->dev_private;
+	uint32_t i;
+	uint16_t n = 0;
+	uint16_t n_ibv = 0;
+
+	if (mlx5_check_rmp_support(dev) < 0)
+		return 0;
+	/* All the configured queues should be enabled. */
+	for (i = 0; i < priv->rxqs_n; ++i) {
+		struct mlx5_rxq_data *rxq = (*priv->rxqs)[i];
+		struct mlx5_rxq_ctrl *rxq_ctrl = container_of
+			(rxq, struct mlx5_rxq_ctrl, rxq);
+
+		if (rxq == NULL || rxq_ctrl->type != MLX5_RXQ_TYPE_STANDARD)
+			continue;
+		n_ibv++;
+		if (mlx5_rxq_rmp_enabled(rxq))
 			++n;
 	}
 	/* Multi-Packet RQ can't be partially configured. */
