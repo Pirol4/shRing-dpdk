@@ -164,6 +164,7 @@ mlx5_rxq_start(struct rte_eth_dev *dev)
 						(dev, &rxq_ctrl->rxq.mr_ctrl,
 						rxq_ctrl->rxq.rxseg[s].mp);
 			}
+			printf("%s\n", __func__);
 			ret = rxq_alloc_elts(rxq_ctrl);
 			if (ret)
 				goto error;

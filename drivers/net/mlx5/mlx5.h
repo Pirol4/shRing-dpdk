@@ -273,6 +273,7 @@ struct mlx5_dev_config {
 	struct mlx5_hca_attr hca_attr; /* HCA attributes. */
 	struct mlx5_lro_config lro; /* LRO configuration. */
 	int rmp_en;
+	uint32_t rqs_per_rmp;
 };
 
 
@@ -1386,6 +1387,9 @@ struct mlx5_priv {
 	uint32_t rss_shared_actions; /* RSS shared actions. */
 	struct mlx5_devx_obj *q_counters; /* DevX queue counter object. */
 	uint32_t counter_set_id; /* Queue counter ID to set in DevX objects. */
+	/* RMP allocator */
+	uint32_t rmpn_users;
+	struct rmp_shared *rmpsh;
 };
 
 #define PORT_ID(priv) ((priv)->dev_data->port_id)

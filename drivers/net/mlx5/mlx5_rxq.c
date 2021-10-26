@@ -140,6 +140,7 @@ rxq_alloc_elts_sprq(struct mlx5_rxq_ctrl *rxq_ctrl)
 	unsigned int i;
 	int err;
 
+	printf("%s queue %d rmpsh %p\n", __func__, rxq_ctrl->rxq.idx, rxq_ctrl->rxq.rmpsh);
 	/* Iterate on segments. */
 	for (i = 0; (i != elts_n); ++i) {
 		struct mlx5_eth_rxseg *seg = &rxq_ctrl->rxq.rxseg[i % sges_n];
@@ -543,6 +544,7 @@ mlx5_rx_queue_start_primary(struct rte_eth_dev *dev, uint16_t idx)
 			container_of(rxq, struct mlx5_rxq_ctrl, rxq);
 	int ret;
 
+	printf("%s\n", __func__);
 	MLX5_ASSERT(rte_eal_process_type() ==  RTE_PROC_PRIMARY);
 	/* Allocate needed buffers. */
 	ret = rxq_alloc_elts(rxq_ctrl);
@@ -587,8 +589,14 @@ mlx5_rx_queue_start_primary(struct rte_eth_dev *dev, uint16_t idx)
 int
 mlx5_rx_queue_start(struct rte_eth_dev *dev, uint16_t idx)
 {
+	struct mlx5_priv *priv = dev->data->dev_private;
 	int ret;
 
+	if (priv->config.rmp_en) {
+		DRV_LOG(ERR, "RMP does not support mlx5_rx_queue_start");
+		rte_errno = EINVAL;
+		return -EINVAL;
+	}
 	if (rte_eth_dev_is_rx_hairpin_queue(dev, idx)) {
 		DRV_LOG(ERR, "Hairpin queue can't be started");
 		rte_errno = EINVAL;

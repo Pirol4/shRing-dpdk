@@ -104,7 +104,7 @@ struct mlx5_rxq_data {
 	unsigned int lro:1; /* Enable LRO. */
 	unsigned int dynf_meta:1; /* Dynamic metadata is configured. */
 	unsigned int mcqe_format:3; /* CQE compression format. */
-	unsigned int rmp:1; /* CQE compression format. */
+	unsigned int rmp:1; /* RMP enabled. */
 	volatile uint32_t *rq_db;
 	volatile uint32_t *cq_db;
 	uint16_t port_id;
@@ -141,7 +141,6 @@ struct mlx5_rxq_data {
 	rte_spinlock_t *uar_lock_cq;
 	/* CQ (UAR) access lock required for 32bit implementations */
 #endif
-	int head;
 	uint32_t tunnel; /* Tunnel information. */
 	int timestamp_offset; /* Dynamic mbuf field for timestamp. */
 	uint64_t timestamp_rx_flag; /* Dynamic mbuf flag for timestamp. */
@@ -150,6 +149,11 @@ struct mlx5_rxq_data {
 	uint32_t flow_meta_port_mask;
 	uint32_t rxseg_n; /* Number of split segment descriptions. */
 	struct mlx5_eth_rxseg rxseg[MLX5_MAX_RXQ_NSEG];
+	struct rmp_shared *rmpsh;
+	// int head;
+	// uint32_t rq_ci;
+	// uint16_t consumed_strd;
+	// uint32_t rq_pi;
 	/* Buffer split segment descriptions - sizes, offsets, pools. */
 } __rte_cache_aligned;
 
@@ -252,6 +256,7 @@ int mlx5_hrxq_modify(struct rte_eth_dev *dev, uint32_t hxrq_idx,
 /* mlx5_rx.c */
 
 uint16_t mlx5_rx_burst(void *dpdk_rxq, struct rte_mbuf **pkts, uint16_t pkts_n);
+uint16_t mlx5_rx_burst_rmp(void *dpdk_rxq, struct rte_mbuf **pkts, uint16_t pkts_n);
 void mlx5_rxq_initialize(struct mlx5_rxq_data *rxq);
 __rte_noinline int mlx5_rx_err_handle(struct mlx5_rxq_data *rxq, uint8_t vec);
 void mlx5_mprq_buf_free_cb(void *addr, void *opaque);
@@ -408,13 +413,13 @@ rmp_mprq_buf_replace(struct mlx5_rxq_data *rxq, uint16_t rq_idx)
 	volatile struct mlx5_wqe_data_seg *wqe;
 	volatile struct mlx5_wqe_srq_next_seg *next;
 	struct mlx5_mprq_buf *buf = (*rxq->mprq_bufs)[rq_idx];
-	int next_idx = rxq->head;
+	int next_idx = rxq->rmpsh->head;
 	void *addr;
 
-	while (!__atomic_compare_exchange_n(&rxq->head, &next_idx, rq_idx, 0,
+	while (!__atomic_compare_exchange_n(&rxq->rmpsh->head, &next_idx, rq_idx, 0,
 					    __ATOMIC_ACQUIRE,
 					    __ATOMIC_RELAXED)) {
-		next_idx = rxq->head;
+		next_idx = rxq->rmpsh->head;
 	}
 	wqe = &((volatile struct mlx5_wqe_mprq *)rxq->wqes)[next_idx].dseg;
 	next = &((volatile struct mlx5_wqe_mprq *)rxq->wqes)[next_idx].next_seg;

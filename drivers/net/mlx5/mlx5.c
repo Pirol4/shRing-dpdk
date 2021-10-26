@@ -116,6 +116,11 @@
 #define MLX5_TX_PP "tx_pp"
 
 /*
+ * RQs per RMP
+ */
+#define MLX5_RQ_PER_RMP "rqs_per_rmp"
+
+/*
  * Receive memory pool enabled.
  */
 #define MLX5_RMP_EN "rmp_en"
@@ -1851,6 +1856,8 @@ mlx5_args_check(const char *key, const char *val, void *opaque)
 		config->cqe_comp_fmt = tmp;
 	} else if (strcmp(MLX5_RMP_EN, key) == 0) {
 		config->rmp_en = !!tmp;
+	} else if (strcmp(MLX5_RQ_PER_RMP, key) == 0) {
+		config->rqs_per_rmp = tmp;
 	} else if (strcmp(MLX5_RXQ_PKT_PAD_EN, key) == 0) {
 		config->hw_padding = !!tmp;
 	} else if (strcmp(MLX5_RX_MPRQ_EN, key) == 0) {
@@ -2015,6 +2022,7 @@ mlx5_args(struct mlx5_dev_config *config, struct rte_devargs *devargs)
 		MLX5_SYS_MEM_EN,
 		MLX5_DECAP_EN,
 		MLX5_RMP_EN,
+		MLX5_RQ_PER_RMP,
 		NULL,
 	};
 	struct rte_kvargs *kvlist;

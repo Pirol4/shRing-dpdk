@@ -7,6 +7,18 @@
 
 #include "mlx5_devx_cmds.h"
 
+// TODO: add wqes
+struct rmp_shared {
+	uint32_t refcount;
+	int rmpn;
+	int head;
+	uint32_t rq_ci;
+	uint32_t rq_pi;
+	uint16_t consumed_strd;
+	struct mlx5dv_devx_umem *umem_obj;
+	void *umem_buf;
+};
+
 /* The standard page size */
 #define MLX5_LOG_PAGE_SIZE 12
 
@@ -65,9 +77,11 @@ void mlx5_devx_rq_destroy(struct mlx5_devx_rq *rq);
 
 __rte_internal
 int mlx5_devx_rq_create(void *ctx, struct mlx5_devx_rq *rq_obj,
-			uint32_t wqe_size, uint16_t log_wqbb_n,
-			struct mlx5_devx_create_rq_attr *attr,
-			struct mlx5_devx_create_rmp_attr *rmp_attr,
-			int socket);
+		    struct rmp_shared *rmpsh, bool is_create_rmp,
+		    uint32_t wqe_size,
+		    uint16_t log_wqbb_n,
+		    struct mlx5_devx_create_rq_attr *attr,
+		    struct mlx5_devx_create_rmp_attr *rmp_attr,
+		    int socket);
 
 #endif /* RTE_PMD_MLX5_COMMON_DEVX_H_ */

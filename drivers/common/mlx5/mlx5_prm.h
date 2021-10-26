@@ -364,6 +364,11 @@ struct mlx5_wqe_mprq {
 	struct mlx5_wqe_data_seg dseg;
 };
 
+struct mlx5_wqe_rmp {
+	struct mlx5_wqe_srq_next_seg next_seg;
+	struct mlx5_wqe_data_seg dseg;
+};
+
 #define MLX5_MPRQ_LEN_MASK 0x000ffff
 #define MLX5_MPRQ_LEN_SHIFT 0
 #define MLX5_MPRQ_STRIDE_NUM_MASK 0x3fff0000
