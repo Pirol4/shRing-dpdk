@@ -114,6 +114,11 @@ l3fwd_lpm_send_packets(int nb_rx, struct rte_mbuf **pkts_burst,
 		j++;
 	}
 
+	for (j = 0; j < qconf->nb_calls; j++) {
+		int off = rte_rand();
+		qconf->mem_calls[off & NB_MEM_CALLS_MASK]++;
+	}
+
 	send_packets_multi(qconf, pkts_burst, dst_port, nb_rx);
 }
 
