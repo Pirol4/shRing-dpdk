@@ -1020,20 +1020,19 @@ mlx5_rx_burst_rmp(void *dpdk_rxq, struct rte_mbuf **pkts, uint16_t pkts_n)
 		/* get linked list head wqe */
 		{
 			int next_idx = rxq->rmpsh->head;
-			printf("rxq %d head before %d ", rxq->idx, rxq->rmpsh->head);
+			// printf("rxq %d head before %d ", rxq->idx, rxq->rmpsh->head);
 			while (!__atomic_compare_exchange_n(&rxq->rmpsh->head, &next_idx,
 						idx, 0, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) {
 				next_idx = rxq->rmpsh->head;
-				printf("contention on rxq next_idx q %d\n", rxq->idx);
+				// printf("contention on rxq next_idx q %d\n", rxq->idx);
+				rxq->stats.contention++;
 			}
-			printf("head after %d ", rxq->rmpsh->head);
+			// printf("head after %d ", rxq->rmpsh->head);
 			volatile struct mlx5_wqe_srq_next_seg *next =
 				&((volatile struct mlx5_wqe_rmp *)rxq->wqes)[next_idx].next_seg;
 			wqe = &((volatile struct mlx5_wqe_rmp *)rxq->wqes)[next_idx].dseg;
 			next->next_wqe_index = htons(idx);
 			(*rxq->rmpsh->elts)[next_idx] = rep;
-			if (htons(idx) != cqe->wqe_counter)
-				printf("received pkt idx %08x (%08x) new head %d len %d\n", htons(idx), cqe->wqe_counter, next_idx, len);
 			// if (idx < next_idx)
 			// 	rte_hexdump(stdout, "hex", cqe, 64);
 		}

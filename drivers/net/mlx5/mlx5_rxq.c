@@ -158,7 +158,8 @@ rxq_alloc_elts_sprq(struct mlx5_rxq_ctrl *rxq_ctrl)
 		printf("reusing RMP elts for queue %d", rxq_ctrl->rxq.idx);
 		goto out;
 	} else {
-		printf("allocating RMP elts for queue %d", rxq_ctrl->rxq.idx);
+		if (rmp)
+			printf("allocating RMP elts for queue %d", rxq_ctrl->rxq.idx);
 	}
 
 

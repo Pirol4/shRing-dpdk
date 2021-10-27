@@ -555,7 +555,7 @@ mlx5_rxq_devx_obj_new(struct rte_eth_dev *dev, uint16_t idx)
 	// printf("%s[%d] wqes %p db %p\n", __func__, idx, rxq_data->wqes, rxq_data->rq_db);
 	rxq_data->cq_arm_sn = 0;
 	rxq_data->cq_ci = 0;
-	if (priv->config.rmp_en && (rxq_data->rmpsh->rq_ci == 0))
+	if (!priv->config.rmp_en || (priv->config.rmp_en && (rxq_data->rmpsh->rq_ci == 0)))
 		mlx5_rxq_initialize(rxq_data);
 	dev->data->rx_queue_state[idx] = RTE_ETH_QUEUE_STATE_STARTED;
 	rxq_ctrl->wqn = tmpl->rq_obj.rq->id;

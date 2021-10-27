@@ -126,6 +126,8 @@ mlx5_stats_get(struct rte_eth_dev *dev, struct rte_eth_stats *stats)
 #endif
 		tmp.ierrors += rxq->stats.idropped;
 		tmp.rx_nombuf += rxq->stats.rx_nombuf;
+
+		tmp.rx_contention += rxq->stats.contention;
 	}
 	for (i = 0; (i != priv->txqs_n); ++i) {
 		struct mlx5_txq_data *txq = (*priv->txqs)[i];

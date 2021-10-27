@@ -31,6 +31,7 @@ struct mlx5_rxq_stats {
 #endif
 	uint64_t idropped; /**< Total of packets dropped when RX ring full. */
 	uint64_t rx_nombuf; /**< Total of RX mbuf allocation failures. */
+	uint64_t contention; /**< Total of linked list RQ atomic cmp-xchg failures. */
 };
 
 /* Compressed CQE context. */

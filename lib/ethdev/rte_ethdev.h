@@ -263,6 +263,7 @@ struct rte_eth_stats {
 	uint64_t ierrors;   /**< Total number of erroneous received packets. */
 	uint64_t oerrors;   /**< Total number of failed transmitted packets. */
 	uint64_t rx_nombuf; /**< Total number of RX mbuf allocation failures. */
+	uint64_t rx_contention; /**< Contention on shared resources  */
 	/* Queue stats are limited to max 256 queues */
 	uint64_t q_ipackets[RTE_ETHDEV_QUEUE_STAT_CNTRS];
 	/**< Total number of queue RX packets. */
