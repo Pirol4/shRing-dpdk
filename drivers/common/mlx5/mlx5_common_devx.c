@@ -320,7 +320,7 @@ mlx5_devx_rq_destroy(struct mlx5_devx_rq *rq)
  */
 int
 mlx5_devx_rq_create(void *ctx, struct mlx5_devx_rq *rq_obj,
-		    struct rmp_shared *rmpsh, bool is_create_rmp,
+		    struct rmp_shared *rmpsh,
 		    uint32_t wqe_size,
 		    uint16_t log_wqbb_n,
 		    struct mlx5_devx_create_rq_attr *attr,
@@ -368,13 +368,9 @@ mlx5_devx_rq_create(void *ctx, struct mlx5_devx_rq *rq_obj,
 	attr->wq_attr.dbr_addr = umem_dbrec;
 	attr->wq_attr.log_wq_pg_sz = MLX5_LOG_PAGE_SIZE;
 
-	if (is_create_rmp) {
-	// if (rmp_attr->state != MLX5_RQC_STATE_RST) {
+	// if (is_create_rmp) {
+	if (rmpsh && !rmpsh->rmpn) {
 		rmp_attr->wq_attr = attr->wq_attr;
-		printf("log_wq_stride %d %d\n", // must be at least 5
-				rmp_attr->wq_attr.log_wq_stride,
-				attr->wq_attr.log_wq_stride);
-
 		rmp = mlx5_devx_cmd_create_rmp(ctx, rmp_attr, socket);
 		if (!rmp) {
 			DRV_LOG(ERR, "Can't create DevX RMP object %d", errno);

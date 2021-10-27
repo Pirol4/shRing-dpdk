@@ -17,6 +17,8 @@ struct rmp_shared {
 	uint16_t consumed_strd;
 	struct mlx5dv_devx_umem *umem_obj;
 	void *umem_buf;
+	struct rte_mbuf *(*elts)[];
+	struct mlx5_mprq_buf *(*mprq_bufs)[];
 };
 
 /* The standard page size */
@@ -77,7 +79,7 @@ void mlx5_devx_rq_destroy(struct mlx5_devx_rq *rq);
 
 __rte_internal
 int mlx5_devx_rq_create(void *ctx, struct mlx5_devx_rq *rq_obj,
-		    struct rmp_shared *rmpsh, bool is_create_rmp,
+		    struct rmp_shared *rmpsh,
 		    uint32_t wqe_size,
 		    uint16_t log_wqbb_n,
 		    struct mlx5_devx_create_rq_attr *attr,

@@ -444,7 +444,8 @@ mlx5_rxq_ibv_obj_new(struct rte_eth_dev *dev, uint16_t idx)
 	rxq_data->wqes = rwq.buf;
 	rxq_data->rq_db = rwq.dbrec;
 	rxq_data->cq_arm_sn = 0;
-	mlx5_rxq_initialize(rxq_data);
+	if (priv->config.rmp_en && (rxq_data->rmpsh->rq_ci == 0))
+		mlx5_rxq_initialize(rxq_data);
 	rxq_data->cq_ci = 0;
 	dev->data->rx_queue_state[idx] = RTE_ETH_QUEUE_STATE_STARTED;
 	rxq_ctrl->wqn = ((struct ibv_wq *)(tmpl->wq))->wq_num;

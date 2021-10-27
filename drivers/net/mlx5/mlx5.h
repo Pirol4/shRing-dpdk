@@ -1387,9 +1387,6 @@ struct mlx5_priv {
 	uint32_t rss_shared_actions; /* RSS shared actions. */
 	struct mlx5_devx_obj *q_counters; /* DevX queue counter object. */
 	uint32_t counter_set_id; /* Queue counter ID to set in DevX objects. */
-	/* RMP allocator */
-	uint32_t rmpn_users;
-	struct rmp_shared *rmpsh;
 };
 
 #define PORT_ID(priv) ((priv)->dev_data->port_id)

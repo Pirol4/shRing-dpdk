@@ -85,8 +85,15 @@ rxq_alloc_elts_mprq(struct mlx5_rxq_ctrl *rxq_ctrl)
 {
 	struct mlx5_rxq_data *rxq = &rxq_ctrl->rxq;
 	unsigned int wqe_n = 1 << rxq->elts_n;
-	unsigned int i;
+	unsigned int i = 0;
 	int err;
+	
+	// TODO: Fix MRPQ support
+	if (mlx5_rxq_rmp_enabled(&rxq_ctrl->rxq)) {
+		DRV_LOG(ERR, "RMP + MPRQ is not supproted yet");
+		rte_errno = EINVAL;
+		goto error;
+	}
 
 	/* Iterate on segments. */
 	for (i = 0; i <= wqe_n; ++i) {
@@ -137,10 +144,24 @@ rxq_alloc_elts_sprq(struct mlx5_rxq_ctrl *rxq_ctrl)
 	unsigned int elts_n = mlx5_rxq_mprq_enabled(&rxq_ctrl->rxq) ?
 		(1 << rxq_ctrl->rxq.elts_n) * (1 << rxq_ctrl->rxq.strd_num_n) :
 		(1 << rxq_ctrl->rxq.elts_n);
-	unsigned int i;
+	unsigned int i = 0;
 	int err;
+	bool rmp = mlx5_rxq_rmp_enabled(&rxq_ctrl->rxq);
 
-	printf("%s queue %d rmpsh %p\n", __func__, rxq_ctrl->rxq.idx, rxq_ctrl->rxq.rmpsh);
+	if (rmp && mlx5_rxq_check_vec_support(&rxq_ctrl->rxq) > 0) {
+		DRV_LOG(ERR, "RMP + VEC is not supproted yet");
+		rte_errno = EINVAL;
+		goto error;
+	}
+
+	if (rmp && ((*rxq_ctrl->rxq.rmpsh->elts)[0] != NULL)) {
+		printf("reusing RMP elts for queue %d", rxq_ctrl->rxq.idx);
+		goto out;
+	} else {
+		printf("allocating RMP elts for queue %d", rxq_ctrl->rxq.idx);
+	}
+
+
 	/* Iterate on segments. */
 	for (i = 0; (i != elts_n); ++i) {
 		struct mlx5_eth_rxseg *seg = &rxq_ctrl->rxq.rxseg[i % sges_n];
@@ -164,7 +185,10 @@ rxq_alloc_elts_sprq(struct mlx5_rxq_ctrl *rxq_ctrl)
 		DATA_LEN(buf) = seg->length;
 		PKT_LEN(buf) = seg->length;
 		NB_SEGS(buf) = 1;
-		(*rxq_ctrl->rxq.elts)[i] = buf;
+		if (rmp)
+			(*rxq_ctrl->rxq.rmpsh->elts)[i] = buf;
+		else
+			(*rxq_ctrl->rxq.elts)[i] = buf;
 	}
 	/* If Rx vector is activated. */
 	if (mlx5_rxq_check_vec_support(&rxq_ctrl->rxq) > 0) {
@@ -193,6 +217,7 @@ rxq_alloc_elts_sprq(struct mlx5_rxq_ctrl *rxq_ctrl)
 		for (j = 0; j < MLX5_VPMD_DESCS_PER_LOOP; ++j)
 			(*rxq->elts)[elts_n + j] = &rxq->fake_mbuf;
 	}
+out:
 	DRV_LOG(DEBUG,
 		"port %u SPRQ queue %u allocated and configured %u segments"
 		" (max %u packets)",
@@ -1151,6 +1176,83 @@ mlx5_mprq_free_mp(struct rte_eth_dev *dev)
 		rxq->mprq_mp = NULL;
 	}
 	priv->mprq_mp = NULL;
+	return 0;
+}
+
+/**
+ * Allocate shared RMP data structures.
+ */
+int mlx5_rmp_alloc(struct rte_eth_dev *dev)
+{
+	struct mlx5_priv *priv = dev->data->dev_private;
+	struct rmp_shared *rmpsh = NULL;
+	uint32_t rmp_users = 0, i;
+
+	if (!priv->config.rmp_en)
+		return 0;
+
+	/* Set mempool for each Rx queue. */
+	for (i = 0; i != priv->rxqs_n; ++i) {
+		struct mlx5_rxq_data *rxq = (*priv->rxqs)[i];
+		struct mlx5_rxq_ctrl *rxq_ctrl = container_of
+			(rxq, struct mlx5_rxq_ctrl, rxq);
+
+		if (rxq == NULL || rxq_ctrl->type != MLX5_RXQ_TYPE_STANDARD) {
+			printf("!!!! Skipping RMP for hairpin queue\n");
+			continue;
+		}
+
+		if ((rmp_users >= priv->config.rqs_per_rmp) || !rmpsh) {
+			// desc_n based on mlx5_rxq_new()
+			uint16_t desc = (1 << rxq->elts_n);
+			uint16_t desc_n = desc + priv->config.rx_vec_en * MLX5_VPMD_DESCS_PER_LOOP;
+			unsigned int mprq_stride_nums = priv->config.mprq.stride_num_n ?
+				priv->config.mprq.stride_num_n : MLX5_MPRQ_STRIDE_NUM_N;
+
+			printf("\n!!!! Creating RMP !!!!\n");
+			rmpsh = mlx5_malloc(MLX5_MEM_ZERO, sizeof(*rmpsh),
+					    RTE_CACHE_LINE_SIZE, rte_socket_id());
+			if (!rmpsh) {
+				rte_errno = ENOMEM;
+				return -rte_errno;
+			}
+
+			rmpsh->elts = mlx5_malloc(MLX5_MEM_RTE | MLX5_MEM_ZERO,
+						  desc_n * sizeof(struct rte_mbuf *),
+						  RTE_CACHE_LINE_SIZE, rte_socket_id());
+
+			if (!rmpsh->elts) {
+				mlx5_free(rmpsh);
+				rte_errno = ENOMEM;
+				return -rte_errno;
+			}
+
+			if (mlx5_check_mprq_support(dev)) {
+				rmpsh->mprq_bufs =
+					mlx5_malloc(MLX5_MEM_RTE | MLX5_MEM_ZERO,
+						    (desc >> mprq_stride_nums) *
+						    sizeof(struct mlx5_mprq_buf *),
+						    RTE_CACHE_LINE_SIZE, rte_socket_id());
+				if (!rmpsh->mprq_bufs) {
+					mlx5_free(rmpsh->elts);
+					mlx5_free(rmpsh);
+					rte_errno = ENOMEM;
+					return -rte_errno;
+				}
+			}
+
+			rmpsh->refcount = 1;
+			rmp_users = 1;
+		} else {
+			printf("\n!!!! Reusing RMP !!!!\n");
+			rmpsh->refcount++;
+			rmp_users++;
+		}
+
+		rxq->rmpsh = rmpsh;
+		rxq->rmp = 1;
+	}
+
 	return 0;
 }
 

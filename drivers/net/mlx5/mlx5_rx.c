@@ -343,6 +343,7 @@ mlx5_rxq_initialize(struct mlx5_rxq_data *rxq)
 	const unsigned int wqe_n = 1 << rxq->elts_n;
 	unsigned int i;
 
+	printf("%s idx %d rmp %p\n", __func__, rxq->idx, rxq->rmpsh);
 	for (i = 0; (i != wqe_n); ++i) {
 		volatile struct mlx5_wqe_data_seg *scat;
 		uintptr_t addr;
@@ -365,7 +366,7 @@ mlx5_rxq_initialize(struct mlx5_rxq_data *rxq)
 			byte_count = (1 << rxq->strd_sz_n) *
 					(1 << rxq->strd_num_n);
 		} else if (rxq->rmp && !mlx5_rxq_mprq_enabled(rxq)) {
-			struct rte_mbuf *buf = (*rxq->elts)[i];
+			struct rte_mbuf *buf = (*rxq->rmpsh->elts)[i];
 			volatile struct mlx5_wqe_srq_next_seg *next;
 
 			next = &((volatile struct mlx5_wqe_rmp *)
@@ -411,7 +412,7 @@ mlx5_rxq_initialize(struct mlx5_rxq_data *rxq)
 	rxq->elts_ci = mlx5_rxq_mprq_enabled(rxq) ?
 		(wqe_n >> rxq->sges_n) * (1 << rxq->strd_num_n) : 0;
 	/* Update doorbell counter. */
-	if (rxq->rmp && rxq->rmpsh->refcount == 1) { // one less for free item in list
+	if (rxq->rmpsh) { // one less for free item in list
 		printf("initializing rq ci/pi\n");
 		rxq->rmpsh->rq_pi = 0;
 		rxq->rmpsh->rq_ci = (wqe_n - 1) >> rxq->sges_n;
@@ -984,7 +985,7 @@ mlx5_rx_burst_rmp(void *dpdk_rxq, struct rte_mbuf **pkts, uint16_t pkts_n)
 			break;
 		idx = rte_be_to_cpu_16(cqe->wqe_counter);
 		wqe = &((volatile struct mlx5_wqe_rmp *)rxq->wqes)[idx].dseg;
-		rep = (*rxq->elts)[idx];
+		rep = (*rxq->rmpsh->elts)[idx];
 		// rte_hexdump(stdout, "hex", cqe, 64);
 		seg = rep;
 		rte_prefetch0(seg);
@@ -1030,7 +1031,7 @@ mlx5_rx_burst_rmp(void *dpdk_rxq, struct rte_mbuf **pkts, uint16_t pkts_n)
 				&((volatile struct mlx5_wqe_rmp *)rxq->wqes)[next_idx].next_seg;
 			wqe = &((volatile struct mlx5_wqe_rmp *)rxq->wqes)[next_idx].dseg;
 			next->next_wqe_index = htons(idx);
-			(*rxq->elts)[next_idx] = rep;
+			(*rxq->rmpsh->elts)[next_idx] = rep;
 			if (htons(idx) != cqe->wqe_counter)
 				printf("received pkt idx %08x (%08x) new head %d len %d\n", htons(idx), cqe->wqe_counter, next_idx, len);
 			// if (idx < next_idx)

@@ -137,6 +137,11 @@ mlx5_rxq_start(struct rte_eth_dev *dev)
 	unsigned int i;
 	int ret = 0;
 
+	/* Allocate RMP data structures. */
+	if (mlx5_rmp_alloc(dev)) {
+		return -rte_errno;
+	}
+
 	/* Allocate/reuse/resize mempool for Multi-Packet RQ. */
 	if (mlx5_mprq_alloc_mp(dev)) {
 		/* Should not release Rx queues but return immediately. */
@@ -164,7 +169,6 @@ mlx5_rxq_start(struct rte_eth_dev *dev)
 						(dev, &rxq_ctrl->rxq.mr_ctrl,
 						rxq_ctrl->rxq.rxseg[s].mp);
 			}
-			printf("%s\n", __func__);
 			ret = rxq_alloc_elts(rxq_ctrl);
 			if (ret)
 				goto error;
