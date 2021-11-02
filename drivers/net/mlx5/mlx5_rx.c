@@ -26,6 +26,7 @@
 #include "mlx5_utils.h"
 #include "mlx5_rxtx.h"
 #include "mlx5_rx.h"
+#include "mlx5_rxatomics.h"
 
 
 static __rte_always_inline uint32_t
@@ -343,7 +344,7 @@ mlx5_rxq_initialize(struct mlx5_rxq_data *rxq)
 	const unsigned int wqe_n = 1 << rxq->elts_n;
 	unsigned int i;
 
-	printf("%s idx %d rmp %p\n", __func__, rxq->idx, rxq->rmpsh);
+	printf("%s idx %d rmp %p\n", __func__, rxq->idx, (void *)rxq->rmpsh);
 	for (i = 0; (i != wqe_n); ++i) {
 		volatile struct mlx5_wqe_data_seg *scat;
 		uintptr_t addr;
@@ -357,7 +358,6 @@ mlx5_rxq_initialize(struct mlx5_rxq_data *rxq)
 			next = &((volatile struct mlx5_wqe_mprq *)
 				rxq->wqes)[i].next_seg;
 			next->next_wqe_index = htons((i + 1) & wq_mask);
-			rxq->rmpsh->head = i;
 
 			scat = &((volatile struct mlx5_wqe_mprq *)
 				rxq->wqes)[i].dseg;
@@ -368,12 +368,14 @@ mlx5_rxq_initialize(struct mlx5_rxq_data *rxq)
 		} else if (rxq->rmp && !mlx5_rxq_mprq_enabled(rxq)) {
 			struct rte_mbuf *buf = (*rxq->rmpsh->elts)[i];
 			volatile struct mlx5_wqe_srq_next_seg *next;
+			const uint32_t wq_mask = (1 << rxq->elts_n) - 1;
 
 			next = &((volatile struct mlx5_wqe_rmp *)
 				rxq->wqes)[i].next_seg;
-			next->next_wqe_index = htons((i + 1));
-			rxq->rmpsh->head = i;
-			// printf("creating wqe[%d]->next = %d\n", i, htons(i+1));
+			next->next_wqe_index = htons((i + 1) & wq_mask);
+			/* Experiment with reverse WQE order -> low performance */
+			// next->next_wqe_index = htons((i - 1) & wq_mask);
+			printf("creating %p[%d]->next = %d\n", rxq->wqes, i, ntohs(next->next_wqe_index));
 
 			scat = &((volatile struct mlx5_wqe_rmp *)
 					rxq->wqes)[i].dseg;
@@ -416,6 +418,8 @@ mlx5_rxq_initialize(struct mlx5_rxq_data *rxq)
 		printf("initializing rq ci/pi\n");
 		rxq->rmpsh->rq_pi = 0;
 		rxq->rmpsh->rq_ci = (wqe_n - 1) >> rxq->sges_n;
+		rxq->rmpsh->head = (wqe_n - 1) >> rxq->sges_n;
+		printf("initializing head %d\n", rxq->rmpsh->head);
 		printf("ci %d %d %d\n", rxq->rq_ci, wqe_n, rxq->sges_n);
 		rte_io_wmb();
 		*rxq->rq_db = rte_cpu_to_be_32(rxq->rmpsh->rq_ci);
@@ -957,23 +961,24 @@ mlx5_rx_burst(void *dpdk_rxq, struct rte_mbuf **pkts, uint16_t pkts_n)
 	return i;
 }
 
+////////////////////////////////////////////////////////////////////////////////////////////////
+// RMP WIP - maintains original list structure - TODO support struggler threads
+// ////////////////////////////////////////////////////////////////////////////////////////////////
 uint16_t
 mlx5_rx_burst_rmp(void *dpdk_rxq, struct rte_mbuf **pkts, uint16_t pkts_n)
 {
 	struct mlx5_rxq_data *rxq = dpdk_rxq;
 	const unsigned int wqe_cnt = (1 << rxq->elts_n) - 1;
 	const unsigned int cqe_cnt = (1 << rxq->cqe_n) - 1;
-	const unsigned int sges_n = rxq->sges_n;
+	// const unsigned int sges_n = rxq->sges_n;
 	struct rte_mbuf *pkt = NULL;
 	struct rte_mbuf *seg = NULL;
 	volatile struct mlx5_cqe *cqe;
 	unsigned int i = 0;
-	unsigned int rq_ci = rxq->rmpsh->rq_ci << sges_n;
-	unsigned int org_rq_ci = rq_ci;
 	int len = 0; /* keep its value across iterations. */
+	uint16_t idx;
 
 	while (pkts_n) {
-		uint16_t idx;
 		volatile struct mlx5_wqe_data_seg *wqe;
 		struct rte_mbuf *rep;
 		volatile struct mlx5_mini_cqe8 *mcqe = NULL;
@@ -986,6 +991,16 @@ mlx5_rx_burst_rmp(void *dpdk_rxq, struct rte_mbuf **pkts, uint16_t pkts_n)
 		idx = rte_be_to_cpu_16(cqe->wqe_counter);
 		wqe = &((volatile struct mlx5_wqe_rmp *)rxq->wqes)[idx].dseg;
 		rep = (*rxq->rmpsh->elts)[idx];
+
+		#define IDX2QWORD(x)		((x) >> 6)
+		#define IDX2BIT(x)		(1ULL << ((x) & 63))
+		#define IDX2MASKLO(x)		(IDX2BIT((x)+1) - 1)
+		#define IDX2MASKHI(x)		(~IDX2MASKLO(x))
+		atomic_bittestandset_x86(&rxq->rmpsh->uwbmp[IDX2QWORD(idx)], idx & 63);
+		// printf("[%d] update bit %d (0x%016llx) uwbmp[%d] = 0x%016llx\n",
+		//        rxq->idx, idx, IDX2BIT(idx), IDX2QWORD(idx),
+		//        rxq->rmpsh->uwbmp[IDX2QWORD(idx)]);
+
 		// rte_hexdump(stdout, "hex", cqe, 64);
 		seg = rep;
 		rte_prefetch0(seg);
@@ -1017,25 +1032,7 @@ mlx5_rx_burst_rmp(void *dpdk_rxq, struct rte_mbuf **pkts, uint16_t pkts_n)
 		PKT_LEN(rep) = PKT_LEN(seg);
 		SET_DATA_OFF(rep, DATA_OFF(seg));
 		PORT(rep) = PORT(seg);
-		/* get linked list head wqe */
-		{
-			int next_idx = rxq->rmpsh->head;
-			// printf("rxq %d head before %d ", rxq->idx, rxq->rmpsh->head);
-			while (!__atomic_compare_exchange_n(&rxq->rmpsh->head, &next_idx,
-						idx, 0, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) {
-				next_idx = rxq->rmpsh->head;
-				// printf("contention on rxq next_idx q %d\n", rxq->idx);
-				rxq->stats.contention++;
-			}
-			// printf("head after %d ", rxq->rmpsh->head);
-			volatile struct mlx5_wqe_srq_next_seg *next =
-				&((volatile struct mlx5_wqe_rmp *)rxq->wqes)[next_idx].next_seg;
-			wqe = &((volatile struct mlx5_wqe_rmp *)rxq->wqes)[next_idx].dseg;
-			next->next_wqe_index = htons(idx);
-			(*rxq->rmpsh->elts)[next_idx] = rep;
-			// if (idx < next_idx)
-			// 	rte_hexdump(stdout, "hex", cqe, 64);
-		}
+		(*rxq->rmpsh->elts)[idx] = rep;
 		/*
 		 * Fill NIC descriptor with the new buffer. The lkey and size
 		 * of the buffers are already known, only the buffer address
@@ -1048,7 +1045,6 @@ mlx5_rx_burst_rmp(void *dpdk_rxq, struct rte_mbuf **pkts, uint16_t pkts_n)
 		if (len > DATA_LEN(seg)) {
 			len -= DATA_LEN(seg);
 			++NB_SEGS(pkt);
-			++rq_ci;
 			continue;
 		}
 		DATA_LEN(seg) = len;
@@ -1062,22 +1058,42 @@ mlx5_rx_burst_rmp(void *dpdk_rxq, struct rte_mbuf **pkts, uint16_t pkts_n)
 		--pkts_n;
 		++i;
 		/* Align consumer index to the next stride. */
-		rq_ci >>= sges_n;
-		++rq_ci;
-		rq_ci <<= sges_n;
 	}
-	if (unlikely(i == 0 && ((rq_ci >> sges_n) == rxq->rq_ci)))
+	if (unlikely(i == 0))
 		return 0;
-	/* Update the consumer index. */
-	// rxq->rq_ci = rq_ci >> sges_n;
-	/* TODO: check if another process is running and avoid MMIO if possible */
-	__atomic_add_fetch(&rxq->rmpsh->rq_ci, rq_ci - org_rq_ci, __ATOMIC_ACQUIRE);
-	rte_io_wmb();
 	*rxq->cq_db = rte_cpu_to_be_32(rxq->cq_ci);
 	rte_io_wmb();
-	// *rxq->rq_db = rte_cpu_to_be_32(rxq->rq_ci);
-	// if (rq_ci - org_rq_ci > 0) printf("rq %d inc %d (/%d)\n", rxq->idx, rq_ci - org_rq_ci, rxq->rmpsh->rq_ci);
-	*rxq->rq_db = rte_cpu_to_be_32(rxq->rmpsh->rq_ci);
+	/* TODO: check if another process is running and avoid MMIO if possible */
+	/////////////////////////////////////////////////////////////////////////////////
+	// once 64 in-sequence packets are received, ring doorbell and zeroize bitmap
+	////////////////////////////////////////////////////////////////////////////////
+	#define THRESHOLD		(64)
+	uint16_t head = rxq->rmpsh->head;
+	uint16_t head_idx = head & wqe_cnt;
+	uint64_t blk, mask;
+	// printf("[%d] idx - head = %d\n", rxq->idx, (idx - head_idx) & wqe_cnt);
+	if (((idx - head_idx) & wqe_cnt) >= THRESHOLD) {
+		// printf("[%d] greater than THRESHOLD\n", rxq->idx);
+		blk = rxq->rmpsh->uwbmp[IDX2QWORD((head_idx + 1) & wqe_cnt)];
+		mask = IDX2MASKHI(head_idx);
+		RTE_VERIFY(mask + 1 == 0);
+		// printf("[%d] testing head %d 0x%016llx & 0x%016llx\n",
+		// 	rxq->idx, head_idx, blk, mask);
+		if ((blk & mask) == mask) {
+			/* TODO: hidden assumption about (THRESHOLD % 64 == 0) */
+			rxq->rmpsh->uwbmp[IDX2QWORD(head_idx + 1) & wqe_cnt] &= ~mask;
+			if (__atomic_compare_exchange_n(&rxq->rmpsh->head, &head,
+							 head+THRESHOLD, 0, __ATOMIC_ACQUIRE,
+							 __ATOMIC_RELAXED)) {
+				// printf("[%d] update LL new head %d\n", rxq->idx, head+THRESHOLD);
+				/* Update the consumer index. */
+				*rxq->rq_db = rte_cpu_to_be_32(rxq->rmpsh->head);
+			} else {
+				// printf("[%d] failed to update LL\n", rxq->idx);
+				rxq->stats.contention++;
+			}
+		}
+	}
 #ifdef MLX5_PMD_SOFT_COUNTERS
 	/* Increment packets counter. */
 	rxq->stats.ipackets += i;
@@ -1085,11 +1101,15 @@ mlx5_rx_burst_rmp(void *dpdk_rxq, struct rte_mbuf **pkts, uint16_t pkts_n)
 	return i;
 }
 
+////////////////////////////////////////////////////////////////////////////////////////////////
+// RMP works with one atomic_add_fetch per burst - 19Gbps one core
+// Any solution with out-of-sequence WQEs will degrade performance
+////////////////////////////////////////////////////////////////////////////////////////////////
 // uint16_t
 // mlx5_rx_burst_rmp(void *dpdk_rxq, struct rte_mbuf **pkts, uint16_t pkts_n)
 // {
 // 	struct mlx5_rxq_data *rxq = dpdk_rxq;
-// 	const unsigned int wqe_cnt = (1 << rxq->elts_n) - 1;
+// 	// const unsigned int wqe_cnt = (1 << rxq->elts_n) - 1;
 // 	const unsigned int cqe_cnt = (1 << rxq->cqe_n) - 1;
 // 	const unsigned int sges_n = rxq->sges_n;
 // 	struct rte_mbuf *pkt = NULL;
@@ -1099,29 +1119,32 @@ mlx5_rx_burst_rmp(void *dpdk_rxq, struct rte_mbuf **pkts, uint16_t pkts_n)
 // 	unsigned int rq_ci = rxq->rmpsh->rq_ci << sges_n;
 // 	unsigned int org_rq_ci = rq_ci;
 // 	int len = 0; /* keep its value across iterations. */
+// 	volatile struct mlx5_wqe_srq_next_seg *tail = NULL;
+// 	uint16_t head_idx;
+// 	uint16_t idx;
 // 
 // 	while (pkts_n) {
-// 		uint16_t idx;
 // 		volatile struct mlx5_wqe_data_seg *wqe;
 // 		struct rte_mbuf *rep;
 // 		volatile struct mlx5_mini_cqe8 *mcqe = NULL;
 // 
 // 		cqe = &(*rxq->cqes)[rxq->cq_ci & cqe_cnt];
+// 		rte_prefetch0(cqe);
+// 		len = mlx5_rx_poll_len(rxq, cqe, cqe_cnt, &mcqe);
+// 		if (!len)
+// 			break;
 // 		idx = rte_be_to_cpu_16(cqe->wqe_counter);
 // 		wqe = &((volatile struct mlx5_wqe_rmp *)rxq->wqes)[idx].dseg;
-// 		rep = (*rxq->elts)[idx];
-// 
-// 
-// 		if (pkt)
-// 			NEXT(seg) = rep;
+// 		rep = (*rxq->rmpsh->elts)[idx];
+// 		// rte_hexdump(stdout, "hex", cqe, 64);
 // 		seg = rep;
 // 		rte_prefetch0(seg);
-// 		rte_prefetch0(cqe);
 // 		rte_prefetch0(wqe);
-// 		/* Allocate the buf from the same pool. */
+// 
 // 		rep = rte_mbuf_raw_alloc(seg->pool);
 // 		if (unlikely(rep == NULL)) {
 // 			++rxq->stats.rx_nombuf;
+// 			printf("rxq %d nombuf!!!\n", rxq->idx);
 // 			if (!pkt) {
 // 				/*
 // 				 * no buffers before we even started,
@@ -1129,65 +1152,32 @@ mlx5_rx_burst_rmp(void *dpdk_rxq, struct rte_mbuf **pkts, uint16_t pkts_n)
 // 				 */
 // 				break;
 // 			}
-// 			while (pkt != seg) {
-// 				MLX5_ASSERT(pkt != (*rxq->elts)[idx]);
-// 				rep = NEXT(pkt);
-// 				NEXT(pkt) = NULL;
-// 				NB_SEGS(pkt) = 1;
-// 				rte_mbuf_raw_free(pkt);
-// 				pkt = rep;
-// 			}
-// 			rq_ci >>= sges_n;
-// 			++rq_ci;
-// 			rq_ci <<= sges_n;
-// 			break;
 // 		}
-// 		if (!pkt) {
-// 			// cqe = &(*rxq->cqes)[rxq->cq_ci & cqe_cnt];
-// 			len = mlx5_rx_poll_len(rxq, cqe, cqe_cnt, &mcqe);
-// 			if (!len) {
-// 				rte_mbuf_raw_free(rep);
-// 				break;
-// 			}
-// 			rte_hexdump(stdout, "hex", cqe, 64);
-// 			pkt = seg;
-// 			MLX5_ASSERT(len >= (rxq->crc_present << 2));
-// 			pkt->ol_flags &= EXT_ATTACHED_MBUF;
-// 			rxq_cq_to_mbuf(rxq, pkt, cqe, mcqe);
-// 			if (rxq->crc_present)
-// 				len -= RTE_ETHER_CRC_LEN;
-// 			PKT_LEN(pkt) = len;
-// 			if (cqe->lro_num_seg > 1) {
-// 				mlx5_lro_update_hdr
-// 					(rte_pktmbuf_mtod(pkt, uint8_t *), cqe,
-// 					 mcqe, rxq, len);
-// 				pkt->ol_flags |= PKT_RX_LRO;
-// 				pkt->tso_segsz = len / cqe->lro_num_seg;
-// 			}
-// 		}
+// 
+// 		pkt = seg;
+// 		MLX5_ASSERT(len >= (rxq->crc_present << 2));
+// 		pkt->ol_flags &= EXT_ATTACHED_MBUF;
+// 		rxq_cq_to_mbuf(rxq, pkt, cqe, mcqe);
+// 		if (rxq->crc_present)
+// 			len -= RTE_ETHER_CRC_LEN;
+// 		PKT_LEN(pkt) = len;
+// 
+// 		///////////////////////////////
 // 		DATA_LEN(rep) = DATA_LEN(seg);
 // 		PKT_LEN(rep) = PKT_LEN(seg);
 // 		SET_DATA_OFF(rep, DATA_OFF(seg));
 // 		PORT(rep) = PORT(seg);
 // 		/* get linked list head wqe */
 // 		{
-// 			int next_idx = rxq->rmpsh->head;
-// 			printf("rxq %d head before %d ", rxq->idx, rxq->rmpsh->head);
-// 			while (!__atomic_compare_exchange_n(&rxq->rmpsh->head, &next_idx,
-// 						idx, 0, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) {
-// 				next_idx = rxq->rmpsh->head;
-// 				printf("contention on rxq next_idx q %d\n", rxq->idx);
+// 			if (unlikely(tail == NULL)) {
+// 				head_idx = idx;
+// 				tail = &((volatile struct mlx5_wqe_rmp *)rxq->wqes)[idx].next_seg;
+// 			} else {
+// 				tail->next_wqe_index = htons(idx);
+// 				tail = &((volatile struct mlx5_wqe_rmp *)rxq->wqes)[idx].next_seg;
 // 			}
-// 			printf("head after %d ", rxq->rmpsh->head);
-// 			volatile struct mlx5_wqe_srq_next_seg *next =
-// 				&((volatile struct mlx5_wqe_rmp *)rxq->wqes)[next_idx].next_seg;
-// 			wqe = &((volatile struct mlx5_wqe_rmp *)rxq->wqes)[next_idx].dseg;
-// 			next->next_wqe_index = htons(idx);
-// 			(*rxq->elts)[next_idx] = rep;
-// 			if (htons(idx) != cqe->wqe_counter)
-// 				printf("received pkt idx %08x (%08x) new head %d len %d\n", htons(idx), cqe->wqe_counter, next_idx, len);
-// 			// if (idx < next_idx)
-// 			// 	rte_hexdump(stdout, "hex", cqe, 64);
+// 			(*rxq->rmpsh->elts)[idx] = rep;
+// 			// printf("buf[%d] = %p\n", idx, rte_cpu_to_be_64(rte_pktmbuf_mtod(rep, uintptr_t)));
 // 		}
 // 		/*
 // 		 * Fill NIC descriptor with the new buffer. The lkey and size
@@ -1219,7 +1209,165 @@ mlx5_rx_burst_rmp(void *dpdk_rxq, struct rte_mbuf **pkts, uint16_t pkts_n)
 // 		++rq_ci;
 // 		rq_ci <<= sges_n;
 // 	}
-// 	if (unlikely(i == 0 && ((rq_ci >> sges_n) == rxq->rq_ci)))
+// 	if (unlikely(i == 0 && ((rq_ci >> sges_n) == org_rq_ci)))
+// 		return 0;
+// 
+// 	{
+// 		int next_idx = rxq->rmpsh->head;
+// 		volatile struct mlx5_wqe_srq_next_seg *next;
+// 		next = &((volatile struct mlx5_wqe_rmp *)rxq->wqes)[next_idx].next_seg;
+// 
+// 		while (!__atomic_compare_exchange_n(&rxq->rmpsh->head, &next_idx,
+// 						    idx, 0, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) {
+// 			next_idx = rxq->rmpsh->head;
+// 			// printf("contention on rxq next_idx q %d\n", rxq->idx);
+// 			rxq->stats.contention++;
+// 		}
+// 
+// 		next = &((volatile struct mlx5_wqe_rmp *)rxq->wqes)[next_idx].next_seg;
+// 		next->next_wqe_index = htons(head_idx);
+// 		// {
+// 		// 	int j = 0;
+// 		// 	printf("!!!!!!!!!!!!!!!!!!!!!!\n");
+// 		// 	for (j = 0; j < 1024; j++) {
+// 		// 		printf("%p[%d] = %d\n", rxq->wqes, j,
+// 		// 		       ntohs(((volatile struct mlx5_wqe_rmp *)rxq->wqes)[j].next_seg.next_wqe_index));
+// 		// 	}
+// 		// }
+// 	}
+// 	/* Update the consumer index. */
+// 	// rxq->rq_ci = rq_ci >> sges_n;
+// 	/* TODO: check if another process is running and avoid MMIO if possible */
+// 	__atomic_add_fetch(&rxq->rmpsh->rq_ci, rq_ci - org_rq_ci, __ATOMIC_ACQUIRE);
+// 	rte_io_wmb();
+// 	*rxq->cq_db = rte_cpu_to_be_32(rxq->cq_ci);
+// 	rte_io_wmb();
+// 	// *rxq->rq_db = rte_cpu_to_be_32(rxq->rq_ci);
+// 	// if (rq_ci - org_rq_ci > 0) printf("rq %d inc %d (/%d)\n", rxq->idx, rq_ci - org_rq_ci, rxq->rmpsh->rq_ci);
+// 	*rxq->rq_db = rte_cpu_to_be_32(rxq->rmpsh->rq_ci);
+// #ifdef MLX5_PMD_SOFT_COUNTERS
+// 	/* Increment packets counter. */
+// 	rxq->stats.ipackets += i;
+// #endif
+// 	return i;
+// }
+
+////////////////////////////////////////////////////////////////////////////////////////////////
+// RMP works first attempt
+// ////////////////////////////////////////////////////////////////////////////////////////////////
+// uint16_t
+// mlx5_rx_burst_rmp(void *dpdk_rxq, struct rte_mbuf **pkts, uint16_t pkts_n)
+// {
+// 	struct mlx5_rxq_data *rxq = dpdk_rxq;
+// 	const unsigned int wqe_cnt = (1 << rxq->elts_n) - 1;
+// 	const unsigned int cqe_cnt = (1 << rxq->cqe_n) - 1;
+// 	const unsigned int sges_n = rxq->sges_n;
+// 	struct rte_mbuf *pkt = NULL;
+// 	struct rte_mbuf *seg = NULL;
+// 	volatile struct mlx5_cqe *cqe;
+// 	unsigned int i = 0;
+// 	unsigned int rq_ci = rxq->rmpsh->rq_ci << sges_n;
+// 	unsigned int org_rq_ci = rq_ci;
+// 	int len = 0; /* keep its value across iterations. */
+// 
+// 	while (pkts_n) {
+// 		uint16_t idx;
+// 		volatile struct mlx5_wqe_data_seg *wqe;
+// 		struct rte_mbuf *rep;
+// 		volatile struct mlx5_mini_cqe8 *mcqe = NULL;
+// 
+// 		cqe = &(*rxq->cqes)[rxq->cq_ci & cqe_cnt];
+// 		rte_prefetch0(cqe);
+// 		len = mlx5_rx_poll_len(rxq, cqe, cqe_cnt, &mcqe);
+// 		if (!len)
+// 			break;
+// 		idx = rte_be_to_cpu_16(cqe->wqe_counter);
+// 		wqe = &((volatile struct mlx5_wqe_rmp *)rxq->wqes)[idx].dseg;
+// 		rep = (*rxq->rmpsh->elts)[idx];
+// 		// rte_hexdump(stdout, "hex", cqe, 64);
+// 		seg = rep;
+// 		rte_prefetch0(seg);
+// 		rte_prefetch0(wqe);
+// 
+// 		rep = rte_mbuf_raw_alloc(seg->pool);
+// 		if (unlikely(rep == NULL)) {
+// 			++rxq->stats.rx_nombuf;
+// 			printf("rxq %d nombuf!!!\n", rxq->idx);
+// 			if (!pkt) {
+// 				/*
+// 				 * no buffers before we even started,
+// 				 * bail out silently.
+// 				 */
+// 				break;
+// 			}
+// 		}
+// 
+// 		pkt = seg;
+// 		MLX5_ASSERT(len >= (rxq->crc_present << 2));
+// 		pkt->ol_flags &= EXT_ATTACHED_MBUF;
+// 		rxq_cq_to_mbuf(rxq, pkt, cqe, mcqe);
+// 		if (rxq->crc_present)
+// 			len -= RTE_ETHER_CRC_LEN;
+// 		PKT_LEN(pkt) = len;
+// 
+// 		///////////////////////////////
+// 		DATA_LEN(rep) = DATA_LEN(seg);
+// 		PKT_LEN(rep) = PKT_LEN(seg);
+// 		SET_DATA_OFF(rep, DATA_OFF(seg));
+// 		PORT(rep) = PORT(seg);
+// 		/* get linked list head wqe */
+// 		{
+// 			int next_idx = rxq->rmpsh->head;
+// 			// printf("rxq %d head before %d ", rxq->idx, rxq->rmpsh->head);
+// 			while (!__atomic_compare_exchange_n(&rxq->rmpsh->head, &next_idx,
+// 						idx, 0, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) {
+// 				next_idx = rxq->rmpsh->head;
+// 				// printf("contention on rxq next_idx q %d\n", rxq->idx);
+// 				rxq->stats.contention++;
+// 			}
+// 			// printf("head after %d ", rxq->rmpsh->head);
+// 			volatile struct mlx5_wqe_srq_next_seg *next =
+// 				&((volatile struct mlx5_wqe_rmp *)rxq->wqes)[next_idx].next_seg;
+// 			wqe = &((volatile struct mlx5_wqe_rmp *)rxq->wqes)[next_idx].dseg;
+// 			next->next_wqe_index = htons(idx);
+// 			(*rxq->rmpsh->elts)[next_idx] = rep;
+// 
+//      		// volatile struct mlx5_wqe_srq_next_seg *next =
+//      		//			&((volatile struct mlx5_wqe_rmp *)rxq->wqes)[next_idx].next_seg;
+//      		//		next->next_wqe_index = htons(idx);
+//      		//		 (*rxq->rmpsh->elts)[idx] = rep;
+// 		}
+// 		/*
+// 		 * Fill NIC descriptor with the new buffer. The lkey and size
+// 		 * of the buffers are already known, only the buffer address
+// 		 * changes.
+// 		 */
+// 		wqe->addr = rte_cpu_to_be_64(rte_pktmbuf_mtod(rep, uintptr_t));
+// 		/* If there's only one MR, no need to replace LKey in WQE. */
+// 		if (unlikely(mlx5_mr_btree_len(&rxq->mr_ctrl.cache_bh) > 1))
+// 			wqe->lkey = mlx5_rx_mb2mr(rxq, rep);
+// 		if (len > DATA_LEN(seg)) {
+// 			len -= DATA_LEN(seg);
+// 			++NB_SEGS(pkt);
+// 			++rq_ci;
+// 			continue;
+// 		}
+// 		DATA_LEN(seg) = len;
+// #ifdef MLX5_PMD_SOFT_COUNTERS
+// 		/* Increment bytes counter. */
+// 		rxq->stats.ibytes += PKT_LEN(pkt);
+// #endif
+// 		/* Return packet. */
+// 		*(pkts++) = pkt;
+// 		pkt = NULL;
+// 		--pkts_n;
+// 		++i;
+// 		/* Align consumer index to the next stride. */
+// 		rq_ci >>= sges_n;
+// 		++rq_ci;
+// 		rq_ci <<= sges_n;
+// 	}
+// 	if (unlikely(i == 0 && ((rq_ci >> sges_n) == org_rq_ci)))
 // 		return 0;
 // 	/* Update the consumer index. */
 // 	// rxq->rq_ci = rq_ci >> sges_n;

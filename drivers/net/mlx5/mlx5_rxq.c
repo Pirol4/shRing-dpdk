@@ -1242,6 +1242,18 @@ int mlx5_rmp_alloc(struct rte_eth_dev *dev)
 				}
 			}
 
+			rmpsh->uwbmp = mlx5_malloc(MLX5_MEM_RTE | MLX5_MEM_ZERO,
+						   (desc_n + 63) / 64 * sizeof(uint64_t),
+						   RTE_CACHE_LINE_SIZE, rte_socket_id());
+			if (!rmpsh->uwbmp) {
+				if (rmpsh->mprq_bufs)
+					mlx5_free(rmpsh->mprq_bufs);
+				mlx5_free(rmpsh->elts);
+				mlx5_free(rmpsh);
+				rte_errno = ENOMEM;
+				return -rte_errno;
+			}
+
 			rmpsh->refcount = 1;
 			rmp_users = 1;
 		} else {

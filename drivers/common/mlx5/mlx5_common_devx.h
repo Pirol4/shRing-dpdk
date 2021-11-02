@@ -7,14 +7,17 @@
 
 #include "mlx5_devx_cmds.h"
 
-// TODO: add wqes
+// TODO: seperate to read-only and shared cachelines
 struct rmp_shared {
 	uint32_t refcount;
 	int rmpn;
-	int head;
 	uint32_t rq_ci;
 	uint32_t rq_pi;
 	uint16_t consumed_strd;
+	uint16_t head; /* bounces between cores */
+
+	/* start new cacheline here */
+	uint64_t *uwbmp __rte_cache_aligned; // used wqe bitmap
 	struct mlx5dv_devx_umem *umem_obj;
 	void *umem_buf;
 	struct rte_mbuf *(*elts)[];
