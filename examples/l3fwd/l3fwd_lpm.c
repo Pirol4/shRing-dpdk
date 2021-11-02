@@ -137,6 +137,26 @@ lpm_get_dst_port_with_ipv4(const struct lcore_conf *qconf, struct rte_mbuf *pkt,
 #include "l3fwd_lpm.h"
 #endif
 
+void get_stats(struct lcore_conf *qconf) {
+	int port_id = qconf->rx_queue_list[0].port_id;
+	struct rte_eth_xstat_name *names;
+	int len = rte_eth_xstats_get_names(port_id, 0, 0);
+	names = (struct rte_eth_xstat_name *)
+		malloc(sizeof(struct rte_eth_xstat_name) * len);
+	rte_eth_xstats_get_names(port_id, names, len);
+	struct rte_eth_xstat *xstats;
+	xstats = (struct rte_eth_xstat *)
+		malloc(sizeof(struct rte_eth_xstat) * len);
+	rte_eth_xstats_get(port_id, xstats, len);
+	for (int i = 0; i < len; i++) {
+		printf("%s [%lu] = %ld\n", names[i].name,
+					 xstats[i].id,
+					 xstats[i].value);
+	}
+
+	return;
+}
+
 /* main processing loop */
 int
 lpm_main_loop(__rte_unused void *dummy)
@@ -217,6 +237,13 @@ lpm_main_loop(__rte_unused void *dummy)
 
 		cur_tsc = rte_rdtsc();
 	}
+
+	struct rte_eth_stats stats;
+	rte_eth_stats_get(qconf->rx_queue_list[0].port_id, &stats);
+	printf("\n"
+	       "    oerr %lu ierr %lu nombuf %lu contention %lu\n",
+	       stats.oerrors, stats.ierrors, stats.rx_nombuf, stats.rx_contention);
+	// get_stats(qconf);
 
 	return 0;
 }
