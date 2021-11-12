@@ -375,7 +375,7 @@ mlx5_rxq_initialize(struct mlx5_rxq_data *rxq)
 			next->next_wqe_index = htons((i + 1) & wq_mask);
 			/* Experiment with reverse WQE order -> low performance */
 			// next->next_wqe_index = htons((i - 1) & wq_mask);
-			printf("creating %p[%d]->next = %d\n", rxq->wqes, i, ntohs(next->next_wqe_index));
+			// printf("creating %p[%d]->next = %d\n", rxq->wqes, i, ntohs(next->next_wqe_index));
 
 			scat = &((volatile struct mlx5_wqe_rmp *)
 					rxq->wqes)[i].dseg;
@@ -1081,7 +1081,10 @@ mlx5_rx_burst_rmp(void *dpdk_rxq, struct rte_mbuf **pkts, uint16_t pkts_n)
 		// 	rxq->idx, head_idx, blk, mask);
 		if ((blk & mask) == mask) {
 			/* TODO: hidden assumption about (THRESHOLD % 64 == 0) */
-			rxq->rmpsh->uwbmp[IDX2QWORD(head_idx + 1) & wqe_cnt] &= ~mask;
+			/* TODO: write 8bytes (8/CACHELINE) is not atomic) */
+			// rxq->rmpsh->uwbmp[IDX2QWORD(head_idx + 1) & wqe_cnt] &= ~mask;
+			__atomic_compare_exchange_n(&rxq->rmpsh->uwbmp[IDX2QWORD(head_idx + 1) & wqe_cnt],
+						    &blk, 0, 0, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED);
 			if (__atomic_compare_exchange_n(&rxq->rmpsh->head, &head,
 							 head+THRESHOLD, 0, __ATOMIC_ACQUIRE,
 							 __ATOMIC_RELAXED)) {
