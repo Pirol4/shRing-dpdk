@@ -137,7 +137,7 @@ lpm_get_dst_port_with_ipv4(const struct lcore_conf *qconf, struct rte_mbuf *pkt,
 #include "l3fwd_lpm.h"
 #endif
 
-void get_stats(struct lcore_conf *qconf) {
+static void get_stats(struct lcore_conf *qconf) {
 	int port_id = qconf->rx_queue_list[0].port_id;
 	struct rte_eth_xstat_name *names;
 	int len = rte_eth_xstats_get_names(port_id, 0, 0);
@@ -161,15 +161,20 @@ void get_stats(struct lcore_conf *qconf) {
 int
 lpm_main_loop(__rte_unused void *dummy)
 {
+	static bool valid_measurements = false;
 	struct rte_mbuf *pkts_burst[MAX_PKT_BURST];
 	unsigned lcore_id;
 	uint64_t prev_tsc, diff_tsc, cur_tsc;
+	uint64_t total_start_tsc, total_end_tsc, total_tsc;
 	int i, nb_rx;
 	uint16_t portid;
 	uint8_t queueid;
 	struct lcore_conf *qconf;
 	const uint64_t drain_tsc = (rte_get_tsc_hz() + US_PER_S - 1) /
 		US_PER_S * BURST_TX_DRAIN_US;
+	const uint64_t threshold = 2.1 * 1000 * 1000 * 1000 * 15; // wait 15s before starting measurements
+
+	prev_tsc = 0;
 
 	lcore_id = rte_lcore_id();
 	qconf = &lcore_conf[lcore_id];
@@ -190,14 +195,13 @@ lpm_main_loop(__rte_unused void *dummy)
 			lcore_id, portid, queueid);
 	}
 
-	cur_tsc = rte_rdtsc();
-	prev_tsc = cur_tsc;
-
+	total_start_tsc = rte_rdtsc();
 	while (!force_quit) {
 
 		/*
 		 * TX burst queue drain
 		 */
+		cur_tsc = rte_rdtsc();
 		diff_tsc = cur_tsc - prev_tsc;
 		if (unlikely(diff_tsc > drain_tsc)) {
 
@@ -218,12 +222,25 @@ lpm_main_loop(__rte_unused void *dummy)
 		 * Read packet from RX queues
 		 */
 		for (i = 0; i < qconf->n_rx_queue; ++i) {
+			uint64_t start_tsc;
+			uint64_t end_tsc;
+			uint64_t _diff_tsc;
+
 			portid = qconf->rx_queue_list[i].port_id;
 			queueid = qconf->rx_queue_list[i].queue_id;
+
+			start_tsc = rte_rdtsc();
 			nb_rx = rte_eth_rx_burst(portid, queueid, pkts_burst,
 				qconf->burst);
-			if (nb_rx == 0)
+			end_tsc = rte_rdtsc();
+			_diff_tsc = end_tsc - start_tsc;
+
+			if (nb_rx == 0) {
+				qconf->rx_cycles_idle = (uint64_t) (qconf->rx_cycles_idle + _diff_tsc);
 				continue;
+			} else {
+				qconf->rx_cycles = (uint64_t) (qconf->rx_cycles + _diff_tsc);
+			}
 
 #if defined RTE_ARCH_X86 || defined __ARM_NEON \
 			 || defined RTE_ARCH_PPC_64
@@ -234,16 +251,45 @@ lpm_main_loop(__rte_unused void *dummy)
 							portid, qconf);
 #endif /* X86 */
 		}
-
-		cur_tsc = rte_rdtsc();
+		if (!valid_measurements && (cur_tsc - total_start_tsc) > threshold) {
+			RTE_LOG(INFO, L3FWD, "[+] reseting counters on lcore %u\n", lcore_id);
+			// qconf->lookup_cycles = 0;
+			qconf->rx_cycles_idle = 0;
+			qconf->rx_cycles = 0;
+			qconf->tx_cycles = 0;
+			total_tsc = 0;
+			total_start_tsc = rte_rdtsc();
+			valid_measurements = true;
+		}
 	}
 
+	total_end_tsc = rte_rdtsc();
+	total_tsc = total_end_tsc - total_start_tsc;
+	get_stats(qconf);
 	struct rte_eth_stats stats;
 	rte_eth_stats_get(qconf->rx_queue_list[0].port_id, &stats);
-	printf("\n"
+	printf("    Tx cycles/total=%.2f\n"
+	       "    Rx cycles/total=%.2f\n"
+	       "    lookup cycles/total=%.2f\n"
+	       "    idle/total=%.2f\n"
+	       "    tx_cyc=%lu\n"
+	       "    rx_cyc=%lu\n"
+	       "    lookup_cyc=%lu\n"
+	       "    idle_cyc=%lu\n"
+	       "    total_cyc=%lu\n"
+	       "    %lu mhz clock\n"
 	       "    oerr %lu ierr %lu nombuf %lu contention %lu\n",
+	       (double) qconf->tx_cycles / total_tsc,
+	       (double) qconf->rx_cycles / total_tsc,
+	       (double) qconf->lookup_cycles / total_tsc,
+	       (double) qconf->rx_cycles_idle / total_tsc,
+	       qconf->tx_cycles,
+	       qconf->rx_cycles,
+	       qconf->lookup_cycles,
+	       qconf->rx_cycles_idle,
+	       total_tsc,
+	       (uint64_t)(rte_get_tsc_hz() / 1E6),
 	       stats.oerrors, stats.ierrors, stats.rx_nombuf, stats.rx_contention);
-	// get_stats(qconf);
 
 	return 0;
 }

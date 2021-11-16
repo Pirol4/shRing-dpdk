@@ -77,6 +77,10 @@ struct lcore_conf {
 	void *ipv6_lookup_struct;
 	uint32_t nb_calls;
 	uint16_t burst;
+	uint64_t     rx_cycles; /**< used for RX processing */
+	uint64_t     rx_cycles_idle; /**< used for RX idle processing */
+	uint64_t     tx_cycles; /**< used for TX processing */
+	uint64_t     lookup_cycles; /**< used for lookup processing */
 #define NB_MEM_CALLS (256 * 256 * 16)
 #define NB_MEM_CALLS_MASK (NB_MEM_CALLS- 1)
 	uint64_t mem_calls[NB_MEM_CALLS];

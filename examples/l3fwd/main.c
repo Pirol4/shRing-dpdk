@@ -1139,6 +1139,7 @@ l3fwd_poll_resource_setup(void)
 		}
 		if (ret < 0)
 			rte_exit(EXIT_FAILURE, "init_mem failed\n");
+		printf("allocating %d MBUFs\n", NB_MBUF(1));
 
 		/* init one TX queue per couple (lcore,port) */
 		queueid = 0;
