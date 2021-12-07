@@ -964,19 +964,28 @@ mlx5_rx_burst(void *dpdk_rxq, struct rte_mbuf **pkts, uint16_t pkts_n)
 ////////////////////////////////////////////////////////////////////////////////////////////////
 // RMP WIP - maintains original list structure - TODO support struggler threads
 // ////////////////////////////////////////////////////////////////////////////////////////////////
+
+#define THRESHOLD		(64)
+static inline bool after(uint32_t seq1, uint32_t seq2, uint32_t mask) {
+	return (seq1 > seq2) ?
+		((seq1 - seq2) >= THRESHOLD) :
+		((seq1 + mask - seq2) >= THRESHOLD);
+}
+
 uint16_t
 mlx5_rx_burst_rmp(void *dpdk_rxq, struct rte_mbuf **pkts, uint16_t pkts_n)
 {
 	struct mlx5_rxq_data *rxq = dpdk_rxq;
 	const unsigned int wqe_cnt = (1 << rxq->elts_n) - 1;
 	const unsigned int cqe_cnt = (1 << rxq->cqe_n) - 1;
-	// const unsigned int sges_n = rxq->sges_n;
 	struct rte_mbuf *pkt = NULL;
 	struct rte_mbuf *seg = NULL;
 	volatile struct mlx5_cqe *cqe;
 	unsigned int i = 0;
 	int len = 0; /* keep its value across iterations. */
 	uint16_t idx;
+	uint64_t lbmp = 0;
+	uint16_t lbmp_idx = 0;
 
 	while (pkts_n) {
 		volatile struct mlx5_wqe_data_seg *wqe;
@@ -996,12 +1005,33 @@ mlx5_rx_burst_rmp(void *dpdk_rxq, struct rte_mbuf **pkts, uint16_t pkts_n)
 		#define IDX2BIT(x)		(1ULL << ((x) & 63))
 		#define IDX2MASKLO(x)		(IDX2BIT((x)+1) - 1)
 		#define IDX2MASKHI(x)		(~IDX2MASKLO(x))
-		atomic_bittestandset_x86(&rxq->rmpsh->uwbmp[IDX2QWORD(idx)], idx & 63);
-		// printf("[%d] update bit %d (0x%016llx) uwbmp[%d] = 0x%016llx\n",
-		//        rxq->idx, idx, IDX2BIT(idx), IDX2QWORD(idx),
-		//        rxq->rmpsh->uwbmp[IDX2QWORD(idx)]);
+		if (lbmp_idx != IDX2QWORD(idx)) {
+			if (lbmp) {
+				uint64_t base = __atomic_load_n(&rxq->rmpsh->uwbmp[lbmp_idx], __ATOMIC_RELAXED);
+				uint64_t new = base | lbmp;
+				if (new == 0xffffffffffffffff) {
+					__atomic_store_n(&rxq->rmpsh->uwbmp[lbmp_idx], new, __ATOMIC_RELEASE);
+				} else {
+					while (!__atomic_compare_exchange_n(&rxq->rmpsh->uwbmp[lbmp_idx],
+								   &base, new, 0,
+								   __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) {
+						base = __atomic_load_n(&rxq->rmpsh->uwbmp[lbmp_idx], __ATOMIC_RELAXED);
+						new = base | lbmp;
+					}
+				}
+				// // Debug prints
+				// printf("[%d] update1 uwbmp[%d] = 0x%016llx/0x%016llx uwbmp[%d] = 0x%016llx\n",
+				//        rxq->idx, lbmp_idx,
+				//        rxq->rmpsh->uwbmp[lbmp_idx],
+				//        lbmp,
+				//        lbmp_idx+1,
+				//        rxq->rmpsh->uwbmp[lbmp_idx+1]);
+			}
+			lbmp_idx = IDX2QWORD(idx);
+			lbmp = 0;
+		}
+		lbmp |= IDX2BIT(idx);
 
-		// rte_hexdump(stdout, "hex", cqe, 64);
 		seg = rep;
 		rte_prefetch0(seg);
 		rte_prefetch0(wqe);
@@ -1061,41 +1091,60 @@ mlx5_rx_burst_rmp(void *dpdk_rxq, struct rte_mbuf **pkts, uint16_t pkts_n)
 	}
 	if (unlikely(i == 0))
 		return 0;
+
+	if (lbmp) {
+		uint64_t base = __atomic_load_n(&rxq->rmpsh->uwbmp[lbmp_idx], __ATOMIC_RELAXED);
+		uint64_t new = base | lbmp;
+		if (new == 0xffffffffffffffff) {
+			__atomic_store_n(&rxq->rmpsh->uwbmp[lbmp_idx], new, __ATOMIC_RELEASE);
+		} else {
+			while (!__atomic_compare_exchange_n(&rxq->rmpsh->uwbmp[lbmp_idx],
+							   &base, new, 0,
+							   __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) {
+				base = __atomic_load_n(&rxq->rmpsh->uwbmp[lbmp_idx], __ATOMIC_RELAXED);
+				new = base | lbmp;
+			}
+		}
+		// // Debug prints
+		// printf("[%d] update uwbmp[%d] = 0x%016llx/0x%016llx uwbmp[%d] = 0x%016llx\n",
+		//        rxq->idx, lbmp_idx,
+		//        rxq->rmpsh->uwbmp[lbmp_idx],
+		//        lbmp,
+		//        lbmp_idx+1,
+		//        rxq->rmpsh->uwbmp[lbmp_idx+1]);
+	}
+
 	*rxq->cq_db = rte_cpu_to_be_32(rxq->cq_ci);
 	rte_io_wmb();
-	/* TODO: check if another process is running and avoid MMIO if possible */
+
 	/////////////////////////////////////////////////////////////////////////////////
 	// once 64 in-sequence packets are received, ring doorbell and zeroize bitmap
 	////////////////////////////////////////////////////////////////////////////////
-	#define THRESHOLD		(64)
-	uint16_t head = rxq->rmpsh->head;
-	uint16_t head_idx = head & wqe_cnt;
+	int head = rxq->rmpsh->head;
+	int head_idx = head & wqe_cnt;
 	uint64_t blk, mask;
-	// printf("[%d] idx - head = %d\n", rxq->idx, (idx - head_idx) & wqe_cnt);
-	if (((idx - head_idx) & wqe_cnt) >= THRESHOLD) {
-		// printf("[%d] greater than THRESHOLD\n", rxq->idx);
-		blk = rxq->rmpsh->uwbmp[IDX2QWORD((head_idx + 1) & wqe_cnt)];
+	bool flag = true;
+	// printf("[%d] idx - head = %d (idx %d head %d)\n", rxq->idx, (idx - head_idx) & wqe_cnt, idx, head_idx);
+	while (flag && after(idx, (head_idx + THRESHOLD), 1 + wqe_cnt)) {
+		blk = __atomic_load_n(&rxq->rmpsh->uwbmp[IDX2QWORD((head_idx + 1) & wqe_cnt)], __ATOMIC_RELAXED);
 		mask = IDX2MASKHI(head_idx);
-		RTE_VERIFY(mask + 1 == 0);
-		// printf("[%d] testing head %d 0x%016llx & 0x%016llx\n",
-		// 	rxq->idx, head_idx, blk, mask);
+		// printf("[%d] idx - head = %d (idx %d head %d) idx %d\n", rxq->idx, (idx - head_idx) & wqe_cnt, idx, head_idx, IDX2QWORD((head_idx + 1) & wqe_cnt));
 		if ((blk & mask) == mask) {
 			/* TODO: hidden assumption about (THRESHOLD % 64 == 0) */
-			/* TODO: write 8bytes (8/CACHELINE) is not atomic) */
-			// rxq->rmpsh->uwbmp[IDX2QWORD(head_idx + 1) & wqe_cnt] &= ~mask;
-			__atomic_compare_exchange_n(&rxq->rmpsh->uwbmp[IDX2QWORD(head_idx + 1) & wqe_cnt],
-						    &blk, 0, 0, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED);
+			__atomic_store_n(&rxq->rmpsh->uwbmp[IDX2QWORD((head_idx + 1) & wqe_cnt)], 0, __ATOMIC_ACQUIRE);
 			if (__atomic_compare_exchange_n(&rxq->rmpsh->head, &head,
 							 head+THRESHOLD, 0, __ATOMIC_ACQUIRE,
 							 __ATOMIC_RELAXED)) {
-				// printf("[%d] update LL new head %d\n", rxq->idx, head+THRESHOLD);
 				/* Update the consumer index. */
 				*rxq->rq_db = rte_cpu_to_be_32(rxq->rmpsh->head);
 			} else {
-				// printf("[%d] failed to update LL\n", rxq->idx);
 				rxq->stats.contention++;
 			}
+		} else {
+			flag = false;
 		}
+		head = rxq->rmpsh->head;
+		head_idx = head & wqe_cnt;
 	}
 #ifdef MLX5_PMD_SOFT_COUNTERS
 	/* Increment packets counter. */
