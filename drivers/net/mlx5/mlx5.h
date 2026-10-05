@@ -274,6 +274,8 @@ struct mlx5_dev_config {
 	struct mlx5_lro_config lro; /* LRO configuration. */
 	int rmp_en;
 	uint32_t rqs_per_rmp;
+	int fill_en; /* Rx queues keep a budget of posted buffers, not a full ring. */
+	uint32_t fill_budget; /* Buffers each Rx queue keeps posted to the NIC. */
 };
 
 

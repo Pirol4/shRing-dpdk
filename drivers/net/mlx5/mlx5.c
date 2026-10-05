@@ -126,6 +126,16 @@
 #define MLX5_RMP_EN "rmp_en"
 
 /*
+ * Device parameter to enable the FILL-ring Rx path: an Rx queue keeps only
+ * fill_budget buffers posted to the NIC instead of filling its whole ring,
+ * which decouples the ring size from the I/O working set.
+ */
+#define MLX5_FILL_EN "fill_en"
+
+/* Number of buffers each Rx queue keeps posted when fill_en is set. */
+#define MLX5_FILL_BUDGET "fill_budget"
+
+/*
  * Device parameter to specify skew in nanoseconds on Tx datapath,
  * it represents the time between SQ start WQE processing and
  * appearing actual packet data on the wire.
@@ -1858,6 +1868,10 @@ mlx5_args_check(const char *key, const char *val, void *opaque)
 		config->rmp_en = !!tmp;
 	} else if (strcmp(MLX5_RQ_PER_RMP, key) == 0) {
 		config->rqs_per_rmp = tmp;
+	} else if (strcmp(MLX5_FILL_EN, key) == 0) {
+		config->fill_en = !!tmp;
+	} else if (strcmp(MLX5_FILL_BUDGET, key) == 0) {
+		config->fill_budget = tmp;
 	} else if (strcmp(MLX5_RXQ_PKT_PAD_EN, key) == 0) {
 		config->hw_padding = !!tmp;
 	} else if (strcmp(MLX5_RX_MPRQ_EN, key) == 0) {
@@ -1971,6 +1985,39 @@ mlx5_args_check(const char *key, const char *val, void *opaque)
 }
 
 /**
+ * Check the FILL-ring parameters against each other once all are parsed.
+ *
+ * A single key cannot be validated in mlx5_args_check(): whether fill_budget
+ * is acceptable depends on fill_en, and fill_en on rmp_en.
+ *
+ * @param config
+ *   Device configuration, with every devarg already stored.
+ *
+ * @return
+ *   0 on success, a negative errno value otherwise and rte_errno is set.
+ */
+static int
+mlx5_fill_args_validate(const struct mlx5_dev_config *config)
+{
+	if (!config->fill_en)
+		return 0;
+	if (config->rmp_en) {
+		DRV_LOG(ERR, "fill_en and rmp_en select different Rx paths and"
+			     " cannot be combined");
+		rte_errno = EINVAL;
+		return -rte_errno;
+	}
+	if (config->fill_budget == 0) {
+		DRV_LOG(ERR, "fill_en requires fill_budget > 0");
+		rte_errno = EINVAL;
+		return -rte_errno;
+	}
+	DRV_LOG(INFO, "FILL-ring Rx enabled: %u buffers posted per Rx queue",
+		config->fill_budget);
+	return 0;
+}
+
+/**
  * Parse device parameters.
  *
  * @param config
@@ -2023,6 +2070,8 @@ mlx5_args(struct mlx5_dev_config *config, struct rte_devargs *devargs)
 		MLX5_DECAP_EN,
 		MLX5_RMP_EN,
 		MLX5_RQ_PER_RMP,
+		MLX5_FILL_EN,
+		MLX5_FILL_BUDGET,
 		NULL,
 	};
 	struct rte_kvargs *kvlist;
@@ -2050,7 +2099,7 @@ mlx5_args(struct mlx5_dev_config *config, struct rte_devargs *devargs)
 		}
 	}
 	rte_kvargs_free(kvlist);
-	return 0;
+	return mlx5_fill_args_validate(config);
 }
 
 /**
