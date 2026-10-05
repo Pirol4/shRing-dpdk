@@ -115,6 +115,8 @@ struct mlx5_rxq_data {
 	uint32_t rq_pi;
 	uint32_t cq_ci;
 	uint16_t rq_repl_thresh; /* Threshold for buffer replenishment. */
+	uint16_t fill_budget;
+	/* Buffers kept posted in FILL-ring mode, 0 when the mode is off. */
 	uint32_t byte_mask;
 	union {
 		struct rxq_zip zip; /* Compressed context. */
@@ -259,6 +261,8 @@ int mlx5_hrxq_modify(struct rte_eth_dev *dev, uint32_t hxrq_idx,
 
 uint16_t mlx5_rx_burst(void *dpdk_rxq, struct rte_mbuf **pkts, uint16_t pkts_n);
 uint16_t mlx5_rx_burst_rmp(void *dpdk_rxq, struct rte_mbuf **pkts, uint16_t pkts_n);
+uint16_t mlx5_rx_burst_fill(void *dpdk_rxq, struct rte_mbuf **pkts,
+			    uint16_t pkts_n);
 void mlx5_rxq_initialize(struct mlx5_rxq_data *rxq);
 __rte_noinline int mlx5_rx_err_handle(struct mlx5_rxq_data *rxq, uint8_t vec);
 void mlx5_mprq_buf_free_cb(void *addr, void *opaque);

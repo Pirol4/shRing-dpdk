@@ -961,6 +961,155 @@ mlx5_rx_burst(void *dpdk_rxq, struct rte_mbuf **pkts, uint16_t pkts_n)
 	return i;
 }
 
+/*
+ * FILL-ring Rx path.
+ *
+ * mlx5_rx_burst() refills every WQE in place, so the RQ always holds as many
+ * posted buffers as it has entries and one index, rq_ci, is both the position
+ * packets are read from and the count of WQEs posted. Here the two are kept
+ * apart, the way AF_XDP separates its FILL and RX rings:
+ *
+ *   rq_pi - WQEs consumed: where the next received packet is read from
+ *           (RX ring consumer).
+ *   rq_ci - WQEs posted: where the next empty buffer goes, and the value
+ *           written to the RQ doorbell (FILL ring producer).
+ *
+ * rq_ci - rq_pi buffers are owned by the NIC or hold a packet not yet read.
+ * The queue keeps that at fill_budget, which may be far below the ring size:
+ * the ring stays large enough to grow into, while the I/O working set is the
+ * budget. Only slots in [rq_pi, rq_ci) of the elts array hold an mbuf; the
+ * others are NULL.
+ */
+
+/**
+ * Post empty buffers until the queue holds its budget again.
+ *
+ * A failed allocation leaves the queue short; the next call makes up for it,
+ * because the shortfall is recomputed from the indices every time.
+ *
+ * @param rxq
+ *   Pointer to RX queue structure.
+ */
+static __rte_always_inline void
+mlx5_rxq_fill_post(struct mlx5_rxq_data *rxq)
+{
+	const unsigned int wqe_mask = (1 << rxq->elts_n) - 1;
+	volatile struct mlx5_wqe_data_seg *wqes =
+		(volatile struct mlx5_wqe_data_seg *)rxq->wqes;
+	const struct mlx5_eth_rxseg *seg = &rxq->rxseg[0];
+	uint32_t rq_ci = rxq->rq_ci;
+	unsigned int missing = rxq->fill_budget - (rq_ci - rxq->rq_pi);
+
+	while (missing--) {
+		const unsigned int idx = rq_ci & wqe_mask;
+		struct rte_mbuf *buf = rte_mbuf_raw_alloc(seg->mp);
+
+		if (unlikely(buf == NULL)) {
+			++rxq->stats.rx_nombuf;
+			break;
+		}
+		MLX5_ASSERT((*rxq->elts)[idx] == NULL);
+		SET_DATA_OFF(buf, seg->offset);
+		PORT(buf) = rxq->port_id;
+		DATA_LEN(buf) = seg->length;
+		PKT_LEN(buf) = seg->length;
+		(*rxq->elts)[idx] = buf;
+		/*
+		 * The size and, with a single MR, the lkey of every WQE were
+		 * written at initialization; only the address changes.
+		 */
+		wqes[idx].addr =
+			rte_cpu_to_be_64(rte_pktmbuf_mtod(buf, uintptr_t));
+		if (unlikely(mlx5_mr_btree_len(&rxq->mr_ctrl.cache_bh) > 1))
+			wqes[idx].lkey = mlx5_rx_mb2mr(rxq, buf);
+		++rq_ci;
+	}
+	if (rq_ci == rxq->rq_ci)
+		return;
+	rxq->rq_ci = rq_ci;
+	rte_io_wmb();
+	*rxq->rq_db = rte_cpu_to_be_32(rq_ci);
+}
+
+/**
+ * DPDK callback for RX in FILL-ring mode: single-segment packets only.
+ *
+ * @param dpdk_rxq
+ *   Generic pointer to RX queue structure.
+ * @param[out] pkts
+ *   Array to store received packets.
+ * @param pkts_n
+ *   Maximum number of packets in array.
+ *
+ * @return
+ *   Number of packets successfully received (<= pkts_n).
+ */
+uint16_t
+mlx5_rx_burst_fill(void *dpdk_rxq, struct rte_mbuf **pkts, uint16_t pkts_n)
+{
+	struct mlx5_rxq_data *rxq = dpdk_rxq;
+	const unsigned int wqe_mask = (1 << rxq->elts_n) - 1;
+	const unsigned int cqe_mask = (1 << rxq->cqe_n) - 1;
+	const uint32_t cq_ci = rxq->cq_ci;
+	uint16_t i = 0;
+
+	MLX5_ASSERT(rxq->sges_n == 0);
+	while (i != pkts_n) {
+		const unsigned int idx = rxq->rq_pi & wqe_mask;
+		volatile struct mlx5_cqe *cqe =
+			&(*rxq->cqes)[rxq->cq_ci & cqe_mask];
+		volatile struct mlx5_mini_cqe8 *mcqe = NULL;
+		struct rte_mbuf *pkt = (*rxq->elts)[idx];
+		int len;
+
+		rte_prefetch0(pkt);
+		rte_prefetch0(cqe);
+		len = mlx5_rx_poll_len(rxq, cqe, cqe_mask, &mcqe);
+		if (!len)
+			break;
+		/*
+		 * While the queue recovers from an error the CQ is drained
+		 * with the RQ in reset: those completions carry no packet,
+		 * and the posted buffers are kept for re-initialization.
+		 */
+		if (unlikely(rxq->err_state != MLX5_RXQ_ERR_STATE_NO_ERROR))
+			continue;
+		MLX5_ASSERT(pkt != NULL);
+		MLX5_ASSERT(len >= (rxq->crc_present << 2));
+		/* The slot is empty until a buffer is posted to it again. */
+		(*rxq->elts)[idx] = NULL;
+		++rxq->rq_pi;
+		pkt->ol_flags &= EXT_ATTACHED_MBUF;
+		rxq_cq_to_mbuf(rxq, pkt, cqe, mcqe);
+		if (rxq->crc_present)
+			len -= RTE_ETHER_CRC_LEN;
+		if (cqe->lro_num_seg > 1) {
+			mlx5_lro_update_hdr(rte_pktmbuf_mtod(pkt, uint8_t *),
+					    cqe, mcqe, rxq, len);
+			pkt->ol_flags |= PKT_RX_LRO;
+			pkt->tso_segsz = len / cqe->lro_num_seg;
+		}
+		MLX5_ASSERT(len <= DATA_LEN(pkt));
+		PKT_LEN(pkt) = len;
+		DATA_LEN(pkt) = len;
+#ifdef MLX5_PMD_SOFT_COUNTERS
+		/* Increment bytes counter. */
+		rxq->stats.ibytes += len;
+#endif
+		pkts[i++] = pkt;
+	}
+	if (rxq->cq_ci != cq_ci) {
+		rte_io_wmb();
+		*rxq->cq_db = rte_cpu_to_be_32(rxq->cq_ci);
+	}
+	mlx5_rxq_fill_post(rxq);
+#ifdef MLX5_PMD_SOFT_COUNTERS
+	/* Increment packets counter. */
+	rxq->stats.ipackets += i;
+#endif
+	return i;
+}
+
 ////////////////////////////////////////////////////////////////////////////////////////////////
 // RMP WIP - maintains original list structure - TODO support struggler threads
 // ////////////////////////////////////////////////////////////////////////////////////////////////
