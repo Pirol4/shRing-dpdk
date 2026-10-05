@@ -2007,8 +2007,15 @@ mlx5_fill_args_validate(const struct mlx5_dev_config *config)
 		rte_errno = EINVAL;
 		return -rte_errno;
 	}
-	if (config->fill_budget == 0) {
-		DRV_LOG(ERR, "fill_en requires fill_budget > 0");
+	if (config->fill_budget == 0 || config->fill_budget > UINT16_MAX) {
+		DRV_LOG(ERR, "fill_en requires fill_budget between 1 and %u",
+			UINT16_MAX);
+		rte_errno = EINVAL;
+		return -rte_errno;
+	}
+	if (config->rx_vec_en || config->mprq.enabled) {
+		DRV_LOG(ERR, "fill_en has a scalar single-packet Rx path only:"
+			     " set rx_vec_en=0 and leave mprq_en off");
 		rte_errno = EINVAL;
 		return -rte_errno;
 	}

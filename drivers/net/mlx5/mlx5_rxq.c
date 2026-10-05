@@ -148,6 +148,9 @@ rxq_alloc_elts_sprq(struct mlx5_rxq_ctrl *rxq_ctrl)
 	int err;
 	bool rmp = mlx5_rxq_rmp_enabled(&rxq_ctrl->rxq);
 
+	/* A FILL-ring queue starts with its budget, not with a full ring. */
+	if (rxq_ctrl->rxq.fill_budget)
+		elts_n = rxq_ctrl->rxq.fill_budget;
 	if (rmp && mlx5_rxq_check_vec_support(&rxq_ctrl->rxq) > 0) {
 		DRV_LOG(ERR, "RMP + VEC is not supproted yet");
 		rte_errno = EINVAL;
@@ -1730,6 +1733,23 @@ mlx5_rxq_new(struct rte_eth_dev *dev, uint16_t idx, uint16_t desc,
 	tmpl->priv = priv;
 	tmpl->rxq.mp = rx_seg[0].mp;
 	tmpl->rxq.elts_n = log2above(desc);
+	if (config->fill_en) {
+		/*
+		 * mlx5_rx_burst_fill() reads one buffer per packet, and the
+		 * budget is a number of WQEs of this ring.
+		 */
+		if (tmpl->rxq.sges_n != 0 || config->fill_budget > desc) {
+			DRV_LOG(ERR,
+				"port %u Rx queue %u: fill_en needs"
+				" single-segment packets and fill_budget (%u)"
+				" within the ring size (%u)",
+				dev->data->port_id, idx, config->fill_budget,
+				desc);
+			rte_errno = EINVAL;
+			goto error;
+		}
+		tmpl->rxq.fill_budget = config->fill_budget;
+	}
 	tmpl->rxq.rq_repl_thresh =
 		MLX5_VPMD_RXQ_RPLNSH_THRESH(desc_n);
 	tmpl->rxq.elts =

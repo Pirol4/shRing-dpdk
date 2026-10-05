@@ -212,6 +212,8 @@ mlx5_rx_burst_mode_get(struct rte_eth_dev *dev,
 		snprintf(mode->info, sizeof(mode->info), "%s", "Scalar");
 	} else if (pkt_burst == mlx5_rx_burst_rmp) {
 		snprintf(mode->info, sizeof(mode->info), "%s", "RMP Scalar RQ");
+	} else if (pkt_burst == mlx5_rx_burst_fill) {
+		snprintf(mode->info, sizeof(mode->info), "%s", "FILL-ring Scalar");
 	} else if (pkt_burst == mlx5_rx_burst_rmp_mprq) {
 		snprintf(mode->info, sizeof(mode->info), "%s", "RMP Multi-Packet RQ");
 	} else if (pkt_burst == mlx5_rx_burst_mprq) {
@@ -333,6 +335,89 @@ rxq_cq_to_pkt_type(struct mlx5_rxq_data *rxq, volatile struct mlx5_cqe *cqe,
 }
 
 /**
+ * Move the buffers a FILL-ring queue holds to the first slots of its ring.
+ *
+ * The NIC restarts from WQE 0 whenever the RQ leaves the reset state, while
+ * the buffers held at that moment sit wherever the posted window happened to
+ * be. They are all empty and interchangeable, so their order is not kept.
+ *
+ * @param[in] rxq
+ *   Pointer to RX queue structure.
+ *
+ * @return
+ *   Number of buffers held, now in slots [0, return value).
+ */
+static unsigned int
+mlx5_rxq_fill_rewind(struct mlx5_rxq_data *rxq)
+{
+	const unsigned int wqe_n = 1 << rxq->elts_n;
+	unsigned int held = 0;
+	unsigned int i;
+
+	for (i = 0; i != wqe_n; ++i) {
+		struct rte_mbuf *buf = (*rxq->elts)[i];
+
+		if (buf == NULL)
+			continue;
+		/* held <= i, so a slot not yet visited is never overwritten. */
+		(*rxq->elts)[i] = NULL;
+		(*rxq->elts)[held++] = buf;
+	}
+	return held;
+}
+
+/**
+ * Initialize Rx WQ and indexes of a queue in FILL-ring mode: only the
+ * buffers the queue holds are posted, not the whole ring.
+ *
+ * @param[in] rxq
+ *   Pointer to RX queue structure.
+ */
+static void
+mlx5_rxq_fill_initialize(struct mlx5_rxq_data *rxq)
+{
+	const unsigned int wqe_n = 1 << rxq->elts_n;
+	volatile struct mlx5_wqe_data_seg *wqes =
+		(volatile struct mlx5_wqe_data_seg *)rxq->wqes;
+	const unsigned int held = mlx5_rxq_fill_rewind(rxq);
+	unsigned int i;
+
+	/*
+	 * mlx5_rxq_fill_post() only writes the address of a WQE, so every
+	 * WQE gets its size and lkey here, posted or not. Slots without a
+	 * buffer borrow the lkey of the first one: with a single MR it is
+	 * the right one, and with several the post path rewrites it. No
+	 * buffer at all can only happen on a re-initialization, where the
+	 * WQEs keep what the first one wrote.
+	 */
+	for (i = 0; held != 0 && i != wqe_n; ++i) {
+		struct rte_mbuf *buf = (*rxq->elts)[i];
+		struct rte_mbuf *mr_owner = buf ? buf : (*rxq->elts)[0];
+		const uintptr_t addr = buf ? rte_pktmbuf_mtod(buf, uintptr_t) : 0;
+
+		wqes[i] = (struct mlx5_wqe_data_seg){
+			.addr = rte_cpu_to_be_64(addr),
+			.byte_count = rte_cpu_to_be_32(rxq->rxseg[0].length),
+			.lkey = mlx5_rx_mb2mr(rxq, mr_owner),
+		};
+	}
+	rxq->consumed_strd = 0;
+	rxq->decompressed = 0;
+	rxq->zip = (struct rxq_zip){
+		.ai = 0,
+	};
+	rxq->elts_ci = 0;
+	/* Nothing consumed yet; the doorbell hands over what is held. */
+	rxq->rq_pi = 0;
+	rxq->rq_ci = held;
+	rte_io_wmb();
+	*rxq->rq_db = rte_cpu_to_be_32(rxq->rq_ci);
+	DRV_LOG(INFO, "port %u Rx queue %u: FILL-ring mode, %u of %u WQEs"
+		" posted (budget %u)", rxq->port_id, rxq->idx, held, wqe_n,
+		rxq->fill_budget);
+}
+
+/**
  * Initialize Rx WQ and indexes.
  *
  * @param[in] rxq
@@ -345,6 +430,10 @@ mlx5_rxq_initialize(struct mlx5_rxq_data *rxq)
 	unsigned int i;
 
 	printf("%s idx %d rmp %p\n", __func__, rxq->idx, (void *)rxq->rmpsh);
+	if (rxq->fill_budget) {
+		mlx5_rxq_fill_initialize(rxq);
+		return;
+	}
 	for (i = 0; (i != wqe_n); ++i) {
 		volatile struct mlx5_wqe_data_seg *scat;
 		uintptr_t addr;

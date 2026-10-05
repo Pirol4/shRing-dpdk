@@ -531,6 +531,7 @@ mlx5_dev_supported_ptypes_get(struct rte_eth_dev *dev)
 
 	if (dev->rx_pkt_burst == mlx5_rx_burst ||
 	    dev->rx_pkt_burst == mlx5_rx_burst_rmp ||
+	    dev->rx_pkt_burst == mlx5_rx_burst_fill ||
 	    dev->rx_pkt_burst == mlx5_rx_burst_mprq ||
 	    dev->rx_pkt_burst == mlx5_rx_burst_rmp_mprq ||
 	    dev->rx_pkt_burst == mlx5_rx_burst_vec ||
@@ -590,8 +591,15 @@ eth_rx_burst_t
 mlx5_select_rx_function(struct rte_eth_dev *dev)
 {
 	eth_rx_burst_t rx_pkt_burst = mlx5_rx_burst;
+	struct mlx5_priv *priv = dev->data->dev_private;
 
 	MLX5_ASSERT(dev != NULL);
+	if (priv->config.fill_en) {
+		/* Checked against rx_vec_en, mprq_en and rmp_en at probe. */
+		DRV_LOG(DEBUG, "port %u selected FILL-ring Rx function",
+			dev->data->port_id);
+		return mlx5_rx_burst_fill;
+	}
 	if (mlx5_check_vec_rx_support(dev) > 0) {
 		if (mlx5_mprq_enabled(dev)) {
 			rx_pkt_burst = mlx5_rx_burst_mprq_vec;
