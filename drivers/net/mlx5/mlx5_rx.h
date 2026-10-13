@@ -24,6 +24,15 @@
 /* Support tunnel matching. */
 #define MLX5_FLOW_TUNNEL 10
 
+/* FILL-ring credits (fill_dyn): see mlx5_rxq_fill_credits(). */
+/* Budget wanted per packet of peak backlog, as a fraction. */
+#define MLX5_FILL_HEADROOM_NUM 3
+#define MLX5_FILL_HEADROOM_DEN 2
+/* Seconds in a window; a peak is remembered for one to two of them. */
+#define MLX5_FILL_WINDOW_S 10
+/* While bursts keep coming back full, count the backlog every this many. */
+#define MLX5_FILL_RECOUNT 8
+
 struct mlx5_rxq_stats {
 #ifdef MLX5_PMD_SOFT_COUNTERS
 	uint64_t ipackets; /**< Total of successfully received packets. */
@@ -117,6 +126,8 @@ struct mlx5_rxq_data {
 	uint16_t rq_repl_thresh; /* Threshold for buffer replenishment. */
 	uint16_t fill_budget;
 	/* Buffers kept posted in FILL-ring mode, 0 when the mode is off. */
+	uint16_t fill_held;
+	/* Credits accounted to the queue: its budget, or what is still posted. */
 	uint32_t byte_mask;
 	union {
 		struct rxq_zip zip; /* Compressed context. */
@@ -153,6 +164,23 @@ struct mlx5_rxq_data {
 	uint32_t rxseg_n; /* Number of split segment descriptions. */
 	struct mlx5_eth_rxseg rxseg[MLX5_MAX_RXQ_NSEG];
 	struct rmp_shared *rmpsh;
+	/* FILL-ring credits; fill_pool is NULL when the budget is static. */
+	int32_t *fill_pool; /* Credits no queue of the port holds (atomic). */
+	uint64_t fill_window_end; /* TSC at which the current window closes. */
+	uint64_t fill_window_tsc; /* Length of a window. */
+	uint16_t fill_floor; /* The budget never goes below this. */
+	uint16_t fill_peak[2]; /* Largest backlog: last and current window. */
+	uint8_t fill_polls; /* Bursts since the clock was last read. */
+	uint8_t fill_full_run; /* Consecutive bursts that came back full. */
+	struct {
+		uint64_t budget_sum; /* Budget summed at every clock read. */
+		uint32_t samples; /* Clock reads, for the mean budget. */
+		uint32_t grows; /* Times the budget was raised. */
+		uint32_t shrinks; /* Times the budget was lowered. */
+		uint32_t denied; /* Raises cut short by an empty pool. */
+		uint16_t budget_max; /* Largest budget held. */
+		uint16_t peak_max; /* Largest backlog seen. */
+	} fill_stats;
 	// int head;
 	// uint32_t rq_ci;
 	// uint16_t consumed_strd;
@@ -263,6 +291,7 @@ uint16_t mlx5_rx_burst(void *dpdk_rxq, struct rte_mbuf **pkts, uint16_t pkts_n);
 uint16_t mlx5_rx_burst_rmp(void *dpdk_rxq, struct rte_mbuf **pkts, uint16_t pkts_n);
 uint16_t mlx5_rx_burst_fill(void *dpdk_rxq, struct rte_mbuf **pkts,
 			    uint16_t pkts_n);
+void mlx5_rxq_fill_stats_log(const struct mlx5_rxq_data *rxq);
 void mlx5_rxq_initialize(struct mlx5_rxq_data *rxq);
 __rte_noinline int mlx5_rx_err_handle(struct mlx5_rxq_data *rxq, uint8_t vec);
 void mlx5_mprq_buf_free_cb(void *addr, void *opaque);

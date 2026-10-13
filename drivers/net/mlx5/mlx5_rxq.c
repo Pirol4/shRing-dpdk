@@ -315,6 +315,7 @@ rxq_free_elts_sprq(struct mlx5_rxq_ctrl *rxq_ctrl)
 		PORT_ID(rxq_ctrl->priv), rxq->idx, q_n);
 	if (rxq->elts == NULL)
 		return;
+	mlx5_rxq_fill_stats_log(rxq);
 	/**
 	 * Some mbuf in the Ring belongs to the application.
 	 * They cannot be freed.
@@ -1749,6 +1750,7 @@ mlx5_rxq_new(struct rte_eth_dev *dev, uint16_t idx, uint16_t desc,
 			goto error;
 		}
 		tmpl->rxq.fill_budget = config->fill_budget;
+		tmpl->rxq.fill_held = config->fill_budget;
 	}
 	tmpl->rxq.rq_repl_thresh =
 		MLX5_VPMD_RXQ_RPLNSH_THRESH(desc_n);
@@ -1760,6 +1762,21 @@ mlx5_rxq_new(struct rte_eth_dev *dev, uint16_t idx, uint16_t desc,
 	tmpl->rxq.uar_lock_cq = &priv->sh->uar_lock_cq;
 #endif
 	tmpl->rxq.idx = idx;
+	if (config->fill_en && config->fill_dyn) {
+		/*
+		 * The queue starts at the floor and leaves the rest of its
+		 * entitlement in the pool, for whichever queue needs it.
+		 */
+		tmpl->rxq.fill_floor = config->fill_floor;
+		tmpl->rxq.fill_budget = config->fill_floor;
+		tmpl->rxq.fill_held = config->fill_floor;
+		tmpl->rxq.fill_window_tsc =
+			rte_get_tsc_hz() * MLX5_FILL_WINDOW_S;
+		tmpl->rxq.fill_pool = &priv->fill_pool;
+		__atomic_add_fetch(&priv->fill_pool,
+				   config->fill_budget - config->fill_floor,
+				   __ATOMIC_RELAXED);
+	}
 	__atomic_fetch_add(&tmpl->refcnt, 1, __ATOMIC_RELAXED);
 	LIST_INSERT_HEAD(&priv->rxqsctrl, tmpl, next);
 	return tmpl;
@@ -1873,6 +1890,12 @@ mlx5_rxq_release(struct rte_eth_dev *dev, uint16_t idx)
 	if (!__atomic_load_n(&rxq_ctrl->refcnt, __ATOMIC_RELAXED)) {
 		if (rxq_ctrl->type == MLX5_RXQ_TYPE_STANDARD)
 			mlx5_mr_btree_free(&rxq_ctrl->rxq.mr_ctrl.cache_bh);
+		/* The queue takes its whole entitlement out with it. */
+		if (rxq_ctrl->rxq.fill_pool != NULL)
+			__atomic_sub_fetch(&priv->fill_pool,
+					   (int32_t)priv->config.fill_budget -
+					   rxq_ctrl->rxq.fill_held,
+					   __ATOMIC_RELAXED);
 		LIST_REMOVE(rxq_ctrl, next);
 		mlx5_free(rxq_ctrl);
 		(*priv->rxqs)[idx] = NULL;

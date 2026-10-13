@@ -136,6 +136,19 @@
 #define MLX5_FILL_BUDGET "fill_budget"
 
 /*
+ * Device parameter to let the budgets of a fill_en port follow the load:
+ * fill_budget becomes what each Rx queue is entitled to, their sum the cap on
+ * posted buffers, and a queue holds only what its recent backlog calls for.
+ */
+#define MLX5_FILL_DYN "fill_dyn"
+
+/* Smallest budget a queue shrinks to when fill_dyn is set. */
+#define MLX5_FILL_FLOOR "fill_floor"
+
+/* Default for fill_floor: the largest budget that still writes no DRAM. */
+#define MLX5_FILL_FLOOR_DEFAULT 32
+
+/*
  * Device parameter to specify skew in nanoseconds on Tx datapath,
  * it represents the time between SQ start WQE processing and
  * appearing actual packet data on the wire.
@@ -1872,6 +1885,10 @@ mlx5_args_check(const char *key, const char *val, void *opaque)
 		config->fill_en = !!tmp;
 	} else if (strcmp(MLX5_FILL_BUDGET, key) == 0) {
 		config->fill_budget = tmp;
+	} else if (strcmp(MLX5_FILL_DYN, key) == 0) {
+		config->fill_dyn = !!tmp;
+	} else if (strcmp(MLX5_FILL_FLOOR, key) == 0) {
+		config->fill_floor = tmp;
 	} else if (strcmp(MLX5_RXQ_PKT_PAD_EN, key) == 0) {
 		config->hw_padding = !!tmp;
 	} else if (strcmp(MLX5_RX_MPRQ_EN, key) == 0) {
@@ -1988,7 +2005,8 @@ mlx5_args_check(const char *key, const char *val, void *opaque)
  * Check the FILL-ring parameters against each other once all are parsed.
  *
  * A single key cannot be validated in mlx5_args_check(): whether fill_budget
- * is acceptable depends on fill_en, and fill_en on rmp_en.
+ * is acceptable depends on fill_en, and fill_en on rmp_en. An unset fill_floor
+ * gets its default here, for the same reason.
  *
  * @param config
  *   Device configuration, with every devarg already stored.
@@ -1997,10 +2015,16 @@ mlx5_args_check(const char *key, const char *val, void *opaque)
  *   0 on success, a negative errno value otherwise and rte_errno is set.
  */
 static int
-mlx5_fill_args_validate(const struct mlx5_dev_config *config)
+mlx5_fill_args_validate(struct mlx5_dev_config *config)
 {
-	if (!config->fill_en)
+	if (!config->fill_en) {
+		if (config->fill_dyn) {
+			DRV_LOG(ERR, "fill_dyn requires fill_en");
+			rte_errno = EINVAL;
+			return -rte_errno;
+		}
 		return 0;
+	}
 	if (config->rmp_en) {
 		DRV_LOG(ERR, "fill_en and rmp_en select different Rx paths and"
 			     " cannot be combined");
@@ -2019,8 +2043,24 @@ mlx5_fill_args_validate(const struct mlx5_dev_config *config)
 		rte_errno = EINVAL;
 		return -rte_errno;
 	}
-	DRV_LOG(INFO, "FILL-ring Rx enabled: %u buffers posted per Rx queue",
-		config->fill_budget);
+	if (!config->fill_dyn) {
+		DRV_LOG(INFO,
+			"FILL-ring Rx enabled: %u buffers posted per Rx queue",
+			config->fill_budget);
+		return 0;
+	}
+	if (config->fill_floor == 0)
+		config->fill_floor = RTE_MIN((uint32_t)MLX5_FILL_FLOOR_DEFAULT,
+					     config->fill_budget);
+	if (config->fill_floor > config->fill_budget) {
+		DRV_LOG(ERR, "fill_floor (%u) cannot exceed fill_budget (%u)",
+			config->fill_floor, config->fill_budget);
+		rte_errno = EINVAL;
+		return -rte_errno;
+	}
+	DRV_LOG(INFO, "FILL-ring Rx enabled with credits: each Rx queue is"
+		" entitled to %u buffers and keeps at least %u posted",
+		config->fill_budget, config->fill_floor);
 	return 0;
 }
 
@@ -2079,6 +2119,8 @@ mlx5_args(struct mlx5_dev_config *config, struct rte_devargs *devargs)
 		MLX5_RQ_PER_RMP,
 		MLX5_FILL_EN,
 		MLX5_FILL_BUDGET,
+		MLX5_FILL_DYN,
+		MLX5_FILL_FLOOR,
 		NULL,
 	};
 	struct rte_kvargs *kvlist;

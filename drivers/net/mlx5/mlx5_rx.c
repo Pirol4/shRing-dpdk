@@ -1087,8 +1087,13 @@ mlx5_rxq_fill_post(struct mlx5_rxq_data *rxq)
 		(volatile struct mlx5_wqe_data_seg *)rxq->wqes;
 	const struct mlx5_eth_rxseg *seg = &rxq->rxseg[0];
 	uint32_t rq_ci = rxq->rq_ci;
-	unsigned int missing = rxq->fill_budget - (rq_ci - rxq->rq_pi);
+	const unsigned int posted = rq_ci - rxq->rq_pi;
+	unsigned int missing;
 
+	/* A budget that was just lowered is reached by not posting. */
+	if (posted >= rxq->fill_budget)
+		return;
+	missing = rxq->fill_budget - posted;
 	while (missing--) {
 		const unsigned int idx = rq_ci & wqe_mask;
 		struct rte_mbuf *buf = rte_mbuf_raw_alloc(seg->mp);
@@ -1120,6 +1125,221 @@ mlx5_rxq_fill_post(struct mlx5_rxq_data *rxq)
 	*rxq->rq_db = rte_cpu_to_be_32(rq_ci);
 }
 
+/*
+ * FILL-ring credits (fill_dyn).
+ *
+ * A credit is the right to keep one buffer posted. The queues of a port share
+ * fill_budget credits each; a queue holds only what its recent backlog calls
+ * for and leaves the rest in the port's pool, so the posted total follows the
+ * load and never exceeds what static budgets would post.
+ *
+ * The backlog is what a burst finds waiting: the buffers the NIC used while
+ * the lcore was away. A queue wants MLX5_FILL_HEADROOM times the largest
+ * backlog of the last one to two windows, and twice its budget when the
+ * backlog used every posted buffer, since packets were then probably dropped
+ * and the real need is unknown. It takes credits from the pool when it holds
+ * less and gives them back at the end of a window when it holds more.
+ *
+ * Only the queue's own lcore writes its ring, so a credit is given back by
+ * not re-posting: fill_held counts the credits still tied up, the budget or
+ * what remains posted above it, and only the difference returns to the pool.
+ * The pool is the one word the queues share and it is touched when a budget
+ * changes, never per packet.
+ */
+
+/**
+ * Count the completions waiting in the CQ, up to a known bound.
+ *
+ * Without CQE compression every received packet is one CQE and the NIC writes
+ * them in order, so the CQEs owned by software form a prefix: a binary search
+ * on the ownership bit finds its length.
+ *
+ * @param rxq
+ *   Pointer to RX queue structure.
+ * @param max
+ *   Upper bound: the buffers currently posted.
+ *
+ * @return
+ *   Number of completions not yet read, at most max.
+ */
+static uint16_t
+mlx5_rxq_fill_pending(struct mlx5_rxq_data *rxq, uint16_t max)
+{
+	const unsigned int cqe_n = 1 << rxq->cqe_n;
+	const unsigned int cqe_mask = cqe_n - 1;
+	uint16_t lo = 0;
+	uint16_t hi = max;
+
+	while (lo != hi) {
+		const uint16_t mid = (lo + hi + 1) / 2;
+		const uint32_t ci = rxq->cq_ci + mid - 1;
+
+		if (check_cqe(&(*rxq->cqes)[ci & cqe_mask], cqe_n, ci) !=
+		    MLX5_CQE_STATUS_HW_OWN)
+			lo = mid;
+		else
+			hi = mid - 1;
+	}
+	return lo;
+}
+
+/**
+ * Take credits from the pool of the port.
+ *
+ * @param pool
+ *   Pointer to the pool.
+ * @param want
+ *   Credits wanted.
+ *
+ * @return
+ *   Credits taken, possibly 0.
+ */
+static uint16_t
+mlx5_fill_pool_take(int32_t *pool, uint16_t want)
+{
+	int32_t avail = __atomic_load_n(pool, __ATOMIC_RELAXED);
+	int32_t got;
+
+	do {
+		got = RTE_MIN((int32_t)want, avail);
+		if (got <= 0)
+			return 0;
+	} while (!__atomic_compare_exchange_n(pool, &avail, avail - got, 1,
+					      __ATOMIC_RELAXED,
+					      __ATOMIC_RELAXED));
+	return got;
+}
+
+/**
+ * Move the budget of a queue towards what its backlog calls for.
+ *
+ * @param rxq
+ *   Pointer to RX queue structure.
+ * @param saturated
+ *   The last backlog used every posted buffer.
+ * @param may_shrink
+ *   Lower the budget if it is above the target: only at the end of a window.
+ */
+static __rte_noinline void
+mlx5_rxq_fill_rebudget(struct mlx5_rxq_data *rxq, bool saturated,
+		       bool may_shrink)
+{
+	const uint32_t ring = 1 << rxq->elts_n;
+	const uint32_t peak = RTE_MAX(rxq->fill_peak[0], rxq->fill_peak[1]);
+	uint32_t target = peak * MLX5_FILL_HEADROOM_NUM / MLX5_FILL_HEADROOM_DEN;
+	uint16_t budget = rxq->fill_budget;
+
+	if (saturated)
+		target = RTE_MAX(target, 2u * budget);
+	target = RTE_MIN(RTE_MAX(target, (uint32_t)rxq->fill_floor), ring);
+	if (target > budget) {
+		uint16_t want = target - budget;
+		/* Credits given up but still posted can be taken back first. */
+		const uint16_t back = RTE_MIN(want, rxq->fill_held - budget);
+		const uint16_t got = mlx5_fill_pool_take(rxq->fill_pool,
+							 want - back);
+
+		rxq->fill_held += got;
+		budget += back + got;
+		if (back + got != 0)
+			++rxq->fill_stats.grows;
+		if (back + got != want)
+			++rxq->fill_stats.denied;
+	} else if (may_shrink && target < budget) {
+		budget = target;
+		++rxq->fill_stats.shrinks;
+	}
+	rxq->fill_budget = budget;
+	if (budget > rxq->fill_stats.budget_max)
+		rxq->fill_stats.budget_max = budget;
+}
+
+/**
+ * Close a window if its time is up: forget the older peak and let the budget
+ * come down to what the last window needed.
+ *
+ * @param rxq
+ *   Pointer to RX queue structure.
+ */
+static __rte_noinline void
+mlx5_rxq_fill_tick(struct mlx5_rxq_data *rxq)
+{
+	const uint64_t now = rte_rdtsc();
+
+	rxq->fill_stats.budget_sum += rxq->fill_budget;
+	++rxq->fill_stats.samples;
+	if (now < rxq->fill_window_end)
+		return;
+	rxq->fill_window_end = now + rxq->fill_window_tsc;
+	rxq->fill_peak[0] = rxq->fill_peak[1];
+	rxq->fill_peak[1] = 0;
+	mlx5_rxq_fill_rebudget(rxq, false, true);
+}
+
+/**
+ * Account for one burst of a queue whose budget follows the load.
+ *
+ * @param rxq
+ *   Pointer to RX queue structure.
+ * @param nb_rx
+ *   Packets the burst returned.
+ * @param pkts_n
+ *   Packets the burst was asked for.
+ * @param posted_before
+ *   Buffers that were posted when the burst started.
+ */
+static __rte_always_inline void
+mlx5_rxq_fill_credits(struct mlx5_rxq_data *rxq, uint16_t nb_rx,
+		      uint16_t pkts_n, uint32_t posted_before)
+{
+	const uint32_t posted = rxq->rq_ci - rxq->rq_pi;
+	const uint16_t tied = RTE_MAX((uint32_t)rxq->fill_budget, posted);
+	uint32_t backlog = nb_rx;
+
+	/* Credits given up reach the pool once their buffers are read. */
+	if (unlikely(rxq->fill_held > tied)) {
+		__atomic_add_fetch(rxq->fill_pool, rxq->fill_held - tied,
+				   __ATOMIC_RELAXED);
+		rxq->fill_held = tied;
+	}
+	if (unlikely(++rxq->fill_polls == 0))
+		mlx5_rxq_fill_tick(rxq);
+	if (likely(nb_rx != pkts_n)) {
+		rxq->fill_full_run = 0;
+	} else if (rxq->fill_full_run++ % MLX5_FILL_RECOUNT == 0) {
+		/* A full burst may have left more behind. */
+		backlog += mlx5_rxq_fill_pending(rxq, posted);
+	}
+	if (likely(backlog <= rxq->fill_peak[1]))
+		return;
+	rxq->fill_peak[1] = backlog;
+	if (backlog > rxq->fill_stats.peak_max)
+		rxq->fill_stats.peak_max = backlog;
+	mlx5_rxq_fill_rebudget(rxq, backlog >= posted_before, false);
+}
+
+/**
+ * Report how the budget of a queue moved, when the queue stops.
+ *
+ * @param rxq
+ *   Pointer to RX queue structure.
+ */
+void
+mlx5_rxq_fill_stats_log(const struct mlx5_rxq_data *rxq)
+{
+	if (rxq->fill_pool == NULL || rxq->fill_stats.samples == 0)
+		return;
+	DRV_LOG(INFO, "port %u Rx queue %u: FILL credits: budget %u now,"
+		" %" PRIu64 " mean, %u max (floor %u); peak backlog %u;"
+		" %u grows, %u shrinks, %u denied; pool %d",
+		rxq->port_id, rxq->idx, rxq->fill_budget,
+		rxq->fill_stats.budget_sum / rxq->fill_stats.samples,
+		rxq->fill_stats.budget_max, rxq->fill_floor,
+		rxq->fill_stats.peak_max, rxq->fill_stats.grows,
+		rxq->fill_stats.shrinks, rxq->fill_stats.denied,
+		__atomic_load_n(rxq->fill_pool, __ATOMIC_RELAXED));
+}
+
 /**
  * DPDK callback for RX in FILL-ring mode: single-segment packets only.
  *
@@ -1140,6 +1360,7 @@ mlx5_rx_burst_fill(void *dpdk_rxq, struct rte_mbuf **pkts, uint16_t pkts_n)
 	const unsigned int wqe_mask = (1 << rxq->elts_n) - 1;
 	const unsigned int cqe_mask = (1 << rxq->cqe_n) - 1;
 	const uint32_t cq_ci = rxq->cq_ci;
+	const uint32_t posted_before = rxq->rq_ci - rxq->rq_pi;
 	uint16_t i = 0;
 
 	MLX5_ASSERT(rxq->sges_n == 0);
@@ -1191,6 +1412,9 @@ mlx5_rx_burst_fill(void *dpdk_rxq, struct rte_mbuf **pkts, uint16_t pkts_n)
 		rte_io_wmb();
 		*rxq->cq_db = rte_cpu_to_be_32(rxq->cq_ci);
 	}
+	if (rxq->fill_pool != NULL &&
+	    likely(rxq->err_state == MLX5_RXQ_ERR_STATE_NO_ERROR))
+		mlx5_rxq_fill_credits(rxq, i, pkts_n, posted_before);
 	mlx5_rxq_fill_post(rxq);
 #ifdef MLX5_PMD_SOFT_COUNTERS
 	/* Increment packets counter. */

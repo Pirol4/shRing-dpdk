@@ -276,6 +276,8 @@ struct mlx5_dev_config {
 	uint32_t rqs_per_rmp;
 	int fill_en; /* Rx queues keep a budget of posted buffers, not a full ring. */
 	uint32_t fill_budget; /* Buffers each Rx queue keeps posted to the NIC. */
+	int fill_dyn; /* fill_budget is an entitlement; budgets follow the load. */
+	uint32_t fill_floor; /* Smallest budget of a queue when fill_dyn is set. */
 };
 
 
@@ -1342,6 +1344,7 @@ struct mlx5_priv {
 	/* RX/TX queues. */
 	unsigned int rxqs_n; /* RX queues array size. */
 	unsigned int txqs_n; /* TX queues array size. */
+	int32_t fill_pool; /* FILL-ring credits that no Rx queue holds (atomic). */
 	struct mlx5_rxq_data *(*rxqs)[]; /* RX queues. */
 	struct mlx5_txq_data *(*txqs)[]; /* TX queues. */
 	struct rte_mempool *mprq_mp; /* Mempool for Multi-Packet RQ. */
