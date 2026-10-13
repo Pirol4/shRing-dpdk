@@ -1145,6 +1145,14 @@ mlx5_rxq_fill_post(struct mlx5_rxq_data *rxq)
  * what remains posted above it, and only the difference returns to the pool.
  * The pool is the one word the queues share and it is touched when a budget
  * changes, never per packet.
+ *
+ * Credits up to fill_entitled are the queue's own; what it holds above that
+ * is borrowed. A queue that the pool leaves below its entitlement draws one
+ * of the borrowers, with a chance proportional to what each has borrowed
+ * (the inverse lottery of lottery scheduling, over the credits no ticket
+ * covers), and leaves it a debt. The borrower pays at its next burst by
+ * lowering its budget, whatever its own backlog says, and the credits reach
+ * the pool as its buffers are read. A queue above its entitlement cannot ask.
  */
 
 /**
@@ -1211,6 +1219,87 @@ mlx5_fill_pool_take(int32_t *pool, uint16_t want)
 }
 
 /**
+ * Ask a borrower to give credits back to the pool.
+ *
+ * @param rxq
+ *   Pointer to RX queue structure: a queue below its entitlement.
+ * @param want
+ *   Credits wanted.
+ */
+static void
+mlx5_rxq_fill_reclaim(struct mlx5_rxq_data *rxq, uint16_t want)
+{
+	struct mlx5_priv *priv =
+		container_of(rxq, struct mlx5_rxq_ctrl, rxq)->priv;
+	uint32_t borrowed[2] = { 0, 0 };
+	uint32_t draw = 0;
+	unsigned int pass;
+	unsigned int i;
+
+	/* First pass: how much is borrowed. Second: whose credit is drawn. */
+	for (pass = 0; pass != 2; ++pass) {
+		for (i = 0; i != priv->rxqs_n; ++i) {
+			struct mlx5_rxq_data *other = (*priv->rxqs)[i];
+			uint32_t over;
+			int32_t debt;
+
+			if (other == NULL || other == rxq ||
+			    other->fill_pool == NULL ||
+			    other->fill_held <= other->fill_entitled)
+				continue;
+			over = other->fill_held - other->fill_entitled;
+			borrowed[pass] += over;
+			if (pass == 0 || borrowed[1] <= draw)
+				continue;
+			/* Asking twice for the same credits is one debt. */
+			want = RTE_MIN((uint32_t)want, over);
+			debt = __atomic_load_n(&other->fill_debt,
+					       __ATOMIC_RELAXED);
+			while (debt < want &&
+			       !__atomic_compare_exchange_n(&other->fill_debt,
+							    &debt, want, 1,
+							    __ATOMIC_RELAXED,
+							    __ATOMIC_RELAXED))
+				;
+			++rxq->fill_stats.reclaims;
+			return;
+		}
+		if (borrowed[0] == 0)
+			return;
+		/* xorshift32 */
+		rxq->fill_rng ^= rxq->fill_rng << 13;
+		rxq->fill_rng ^= rxq->fill_rng >> 17;
+		rxq->fill_rng ^= rxq->fill_rng << 5;
+		draw = rxq->fill_rng % borrowed[0];
+	}
+}
+
+/**
+ * Pay a debt: give back borrowed credits another queue is entitled to.
+ *
+ * What cannot be paid from borrowed credits is dropped; the queue that asked
+ * will ask again if it is still short.
+ *
+ * @param rxq
+ *   Pointer to RX queue structure.
+ */
+static __rte_noinline void
+mlx5_rxq_fill_pay(struct mlx5_rxq_data *rxq)
+{
+	const int32_t debt = __atomic_exchange_n(&rxq->fill_debt, 0,
+						 __ATOMIC_RELAXED);
+	const int32_t over = (int32_t)rxq->fill_budget - rxq->fill_entitled;
+	const int32_t pay = RTE_MIN(debt, over);
+
+	if (pay <= 0)
+		return;
+	rxq->fill_budget -= pay;
+	rxq->fill_stats.paid += pay;
+	/* They are another queue's now, though still posted here. */
+	rxq->fill_owed += pay;
+}
+
+/**
  * Move the budget of a queue towards what its backlog calls for.
  *
  * @param rxq
@@ -1229,22 +1318,34 @@ mlx5_rxq_fill_rebudget(struct mlx5_rxq_data *rxq, bool saturated,
 	uint32_t target = peak * MLX5_FILL_HEADROOM_NUM / MLX5_FILL_HEADROOM_DEN;
 	uint16_t budget = rxq->fill_budget;
 
+	rxq->fill_short = 0;
 	if (saturated)
 		target = RTE_MAX(target, 2u * budget);
 	target = RTE_MIN(RTE_MAX(target, (uint32_t)rxq->fill_floor), ring);
 	if (target > budget) {
 		uint16_t want = target - budget;
-		/* Credits given up but still posted can be taken back first. */
-		const uint16_t back = RTE_MIN(want, rxq->fill_held - budget);
+		/*
+		 * Credits given up at the end of a window and still posted
+		 * can be taken back first; those paid to a debt cannot.
+		 */
+		const uint16_t back = RTE_MIN(want, rxq->fill_held - budget -
+						    rxq->fill_owed);
 		const uint16_t got = mlx5_fill_pool_take(rxq->fill_pool,
 							 want - back);
 
 		rxq->fill_held += got;
 		budget += back + got;
+		want -= back + got;
 		if (back + got != 0)
 			++rxq->fill_stats.grows;
-		if (back + got != want)
+		if (want != 0) {
+			rxq->fill_short = 1;
 			++rxq->fill_stats.denied;
+			if (budget < rxq->fill_entitled)
+				mlx5_rxq_fill_reclaim(rxq,
+					RTE_MIN(want, rxq->fill_entitled -
+						      budget));
+		}
 	} else if (may_shrink && target < budget) {
 		budget = target;
 		++rxq->fill_stats.shrinks;
@@ -1268,8 +1369,15 @@ mlx5_rxq_fill_tick(struct mlx5_rxq_data *rxq)
 
 	rxq->fill_stats.budget_sum += rxq->fill_budget;
 	++rxq->fill_stats.samples;
-	if (now < rxq->fill_window_end)
+	if (now < rxq->fill_window_end) {
+		/*
+		 * Short of its own credits: what it asked back may be in the
+		 * pool by now. Borrowed credits are only sought on a new peak.
+		 */
+		if (rxq->fill_short && rxq->fill_budget < rxq->fill_entitled)
+			mlx5_rxq_fill_rebudget(rxq, false, false);
 		return;
+	}
 	rxq->fill_window_end = now + rxq->fill_window_tsc;
 	rxq->fill_peak[0] = rxq->fill_peak[1];
 	rxq->fill_peak[1] = 0;
@@ -1293,14 +1401,19 @@ mlx5_rxq_fill_credits(struct mlx5_rxq_data *rxq, uint16_t nb_rx,
 		      uint16_t pkts_n, uint32_t posted_before)
 {
 	const uint32_t posted = rxq->rq_ci - rxq->rq_pi;
-	const uint16_t tied = RTE_MAX((uint32_t)rxq->fill_budget, posted);
 	uint32_t backlog = nb_rx;
+	uint16_t tied;
 
+	if (unlikely(__atomic_load_n(&rxq->fill_debt, __ATOMIC_RELAXED) != 0))
+		mlx5_rxq_fill_pay(rxq);
+	tied = RTE_MAX((uint32_t)rxq->fill_budget, posted);
 	/* Credits given up reach the pool once their buffers are read. */
 	if (unlikely(rxq->fill_held > tied)) {
-		__atomic_add_fetch(rxq->fill_pool, rxq->fill_held - tied,
-				   __ATOMIC_RELAXED);
+		const uint16_t freed = rxq->fill_held - tied;
+
+		__atomic_add_fetch(rxq->fill_pool, freed, __ATOMIC_RELAXED);
 		rxq->fill_held = tied;
+		rxq->fill_owed -= RTE_MIN(rxq->fill_owed, freed);
 	}
 	if (unlikely(++rxq->fill_polls == 0))
 		mlx5_rxq_fill_tick(rxq);
@@ -1331,12 +1444,14 @@ mlx5_rxq_fill_stats_log(const struct mlx5_rxq_data *rxq)
 		return;
 	DRV_LOG(INFO, "port %u Rx queue %u: FILL credits: budget %u now,"
 		" %" PRIu64 " mean, %u max (floor %u); peak backlog %u;"
-		" %u grows, %u shrinks, %u denied; pool %d",
+		" %u grows, %u shrinks, %u denied, %u reclaims, %u paid;"
+		" pool %d",
 		rxq->port_id, rxq->idx, rxq->fill_budget,
 		rxq->fill_stats.budget_sum / rxq->fill_stats.samples,
 		rxq->fill_stats.budget_max, rxq->fill_floor,
 		rxq->fill_stats.peak_max, rxq->fill_stats.grows,
 		rxq->fill_stats.shrinks, rxq->fill_stats.denied,
+		rxq->fill_stats.reclaims, rxq->fill_stats.paid,
 		__atomic_load_n(rxq->fill_pool, __ATOMIC_RELAXED));
 }
 

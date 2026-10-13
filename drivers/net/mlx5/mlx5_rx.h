@@ -168,7 +168,12 @@ struct mlx5_rxq_data {
 	int32_t *fill_pool; /* Credits no queue of the port holds (atomic). */
 	uint64_t fill_window_end; /* TSC at which the current window closes. */
 	uint64_t fill_window_tsc; /* Length of a window. */
+	int32_t fill_debt; /* Credits another queue asks back (atomic). */
+	uint32_t fill_rng; /* State of the generator that draws a loser. */
+	uint16_t fill_entitled; /* Credits no other queue can ask back. */
+	uint16_t fill_owed; /* Credits paid to a debt and still posted. */
 	uint16_t fill_floor; /* The budget never goes below this. */
+	uint8_t fill_short; /* The last raise was cut short by the pool. */
 	uint16_t fill_peak[2]; /* Largest backlog: last and current window. */
 	uint8_t fill_polls; /* Bursts since the clock was last read. */
 	uint8_t fill_full_run; /* Consecutive bursts that came back full. */
@@ -178,6 +183,8 @@ struct mlx5_rxq_data {
 		uint32_t grows; /* Times the budget was raised. */
 		uint32_t shrinks; /* Times the budget was lowered. */
 		uint32_t denied; /* Raises cut short by an empty pool. */
+		uint32_t reclaims; /* Times it asked a borrower for credits. */
+		uint32_t paid; /* Credits it gave back when asked. */
 		uint16_t budget_max; /* Largest budget held. */
 		uint16_t peak_max; /* Largest backlog seen. */
 	} fill_stats;

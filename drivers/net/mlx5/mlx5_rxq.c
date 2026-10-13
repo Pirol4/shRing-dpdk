@@ -1768,6 +1768,8 @@ mlx5_rxq_new(struct rte_eth_dev *dev, uint16_t idx, uint16_t desc,
 		 * entitlement in the pool, for whichever queue needs it.
 		 */
 		tmpl->rxq.fill_floor = config->fill_floor;
+		tmpl->rxq.fill_entitled = config->fill_budget;
+		tmpl->rxq.fill_rng = (idx + 1) * 2654435761u;
 		tmpl->rxq.fill_budget = config->fill_floor;
 		tmpl->rxq.fill_held = config->fill_floor;
 		tmpl->rxq.fill_window_tsc =
