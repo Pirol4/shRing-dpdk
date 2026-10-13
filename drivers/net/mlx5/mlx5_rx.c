@@ -1403,6 +1403,7 @@ mlx5_rxq_fill_credits(struct mlx5_rxq_data *rxq, uint16_t nb_rx,
 	const uint32_t posted = rxq->rq_ci - rxq->rq_pi;
 	uint32_t backlog = nb_rx;
 	uint16_t tied;
+	bool saturated;
 
 	if (unlikely(__atomic_load_n(&rxq->fill_debt, __ATOMIC_RELAXED) != 0))
 		mlx5_rxq_fill_pay(rxq);
@@ -1423,12 +1424,23 @@ mlx5_rxq_fill_credits(struct mlx5_rxq_data *rxq, uint16_t nb_rx,
 		/* A full burst may have left more behind. */
 		backlog += mlx5_rxq_fill_pending(rxq, posted);
 	}
-	if (likely(backlog <= rxq->fill_peak[1]))
-		return;
-	rxq->fill_peak[1] = backlog;
+	saturated = backlog >= posted_before;
 	if (backlog > rxq->fill_stats.peak_max)
 		rxq->fill_stats.peak_max = backlog;
-	mlx5_rxq_fill_rebudget(rxq, backlog >= posted_before, false);
+	/*
+	 * A backlog that used every posted buffer only says the need is
+	 * larger. Remember one that calls for the doubled budget, or the end
+	 * of the window would shrink the queue back under what just failed.
+	 */
+	if (unlikely(saturated))
+		backlog = RTE_MAX(backlog, (2 * posted_before *
+					    MLX5_FILL_HEADROOM_DEN +
+					    MLX5_FILL_HEADROOM_NUM - 1) /
+					   MLX5_FILL_HEADROOM_NUM);
+	if (likely(backlog <= rxq->fill_peak[1]))
+		return;
+	rxq->fill_peak[1] = RTE_MIN(backlog, (uint32_t)UINT16_MAX);
+	mlx5_rxq_fill_rebudget(rxq, saturated, false);
 }
 
 /**
