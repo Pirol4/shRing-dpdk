@@ -1134,8 +1134,8 @@ mlx5_rxq_fill_post(struct mlx5_rxq_data *rxq)
  * load and never exceeds what static budgets would post.
  *
  * The backlog is what a burst finds waiting: the buffers the NIC used while
- * the lcore was away. A queue wants MLX5_FILL_HEADROOM times the largest
- * backlog of the last one to two windows, and twice its budget when the
+ * the lcore was away. A queue wants fill_headroom percent of the largest
+ * backlog of the last one to two windows (fill_window_ms each), and twice its budget when the
  * backlog used every posted buffer, since packets were then probably dropped
  * and the real need is unknown. It takes credits from the pool when it holds
  * less and gives them back at the end of a window when it holds more.
@@ -1315,7 +1315,7 @@ mlx5_rxq_fill_rebudget(struct mlx5_rxq_data *rxq, bool saturated,
 {
 	const uint32_t ring = 1 << rxq->elts_n;
 	const uint32_t peak = RTE_MAX(rxq->fill_peak[0], rxq->fill_peak[1]);
-	uint32_t target = peak * MLX5_FILL_HEADROOM_NUM / MLX5_FILL_HEADROOM_DEN;
+	uint32_t target = peak * rxq->fill_headroom / 100;
 	uint16_t budget = rxq->fill_budget;
 
 	rxq->fill_short = 0;
@@ -1433,10 +1433,9 @@ mlx5_rxq_fill_credits(struct mlx5_rxq_data *rxq, uint16_t nb_rx,
 	 * of the window would shrink the queue back under what just failed.
 	 */
 	if (unlikely(saturated))
-		backlog = RTE_MAX(backlog, (2 * posted_before *
-					    MLX5_FILL_HEADROOM_DEN +
-					    MLX5_FILL_HEADROOM_NUM - 1) /
-					   MLX5_FILL_HEADROOM_NUM);
+		backlog = RTE_MAX(backlog, (2 * posted_before * 100 +
+					    rxq->fill_headroom - 1) /
+					   rxq->fill_headroom);
 	if (likely(backlog <= rxq->fill_peak[1]))
 		return;
 	rxq->fill_peak[1] = RTE_MIN(backlog, (uint32_t)UINT16_MAX);

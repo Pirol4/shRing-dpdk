@@ -149,6 +149,19 @@
 #define MLX5_FILL_FLOOR_DEFAULT 32
 
 /*
+ * Milliseconds in a fill_dyn window: a queue remembers its peak backlog for
+ * one to two windows and gives surplus credits back at the end of each.
+ */
+#define MLX5_FILL_WINDOW_MS "fill_window_ms"
+#define MLX5_FILL_WINDOW_MS_DEFAULT 10000
+#define MLX5_FILL_WINDOW_MS_MAX 600000
+
+/* Budget a fill_dyn queue wants, in percent of its peak backlog. */
+#define MLX5_FILL_HEADROOM "fill_headroom"
+#define MLX5_FILL_HEADROOM_DEFAULT 150
+#define MLX5_FILL_HEADROOM_MAX 1000
+
+/*
  * Device parameter to specify skew in nanoseconds on Tx datapath,
  * it represents the time between SQ start WQE processing and
  * appearing actual packet data on the wire.
@@ -1889,6 +1902,10 @@ mlx5_args_check(const char *key, const char *val, void *opaque)
 		config->fill_dyn = !!tmp;
 	} else if (strcmp(MLX5_FILL_FLOOR, key) == 0) {
 		config->fill_floor = tmp;
+	} else if (strcmp(MLX5_FILL_WINDOW_MS, key) == 0) {
+		config->fill_window_ms = tmp;
+	} else if (strcmp(MLX5_FILL_HEADROOM, key) == 0) {
+		config->fill_headroom = tmp;
 	} else if (strcmp(MLX5_RXQ_PKT_PAD_EN, key) == 0) {
 		config->hw_padding = !!tmp;
 	} else if (strcmp(MLX5_RX_MPRQ_EN, key) == 0) {
@@ -2005,8 +2022,8 @@ mlx5_args_check(const char *key, const char *val, void *opaque)
  * Check the FILL-ring parameters against each other once all are parsed.
  *
  * A single key cannot be validated in mlx5_args_check(): whether fill_budget
- * is acceptable depends on fill_en, and fill_en on rmp_en. An unset fill_floor
- * gets its default here, for the same reason.
+ * is acceptable depends on fill_en, and fill_en on rmp_en. An unset fill_floor,
+ * fill_window_ms or fill_headroom gets its default here, for the same reason.
  *
  * @param config
  *   Device configuration, with every devarg already stored.
@@ -2017,6 +2034,12 @@ mlx5_args_check(const char *key, const char *val, void *opaque)
 static int
 mlx5_fill_args_validate(struct mlx5_dev_config *config)
 {
+	if (!config->fill_dyn &&
+	    (config->fill_window_ms != 0 || config->fill_headroom != 0)) {
+		DRV_LOG(ERR, "fill_window_ms and fill_headroom require fill_dyn");
+		rte_errno = EINVAL;
+		return -rte_errno;
+	}
 	if (!config->fill_en) {
 		if (config->fill_dyn) {
 			DRV_LOG(ERR, "fill_dyn requires fill_en");
@@ -2058,9 +2081,28 @@ mlx5_fill_args_validate(struct mlx5_dev_config *config)
 		rte_errno = EINVAL;
 		return -rte_errno;
 	}
+	if (config->fill_window_ms == 0)
+		config->fill_window_ms = MLX5_FILL_WINDOW_MS_DEFAULT;
+	if (config->fill_window_ms > MLX5_FILL_WINDOW_MS_MAX) {
+		DRV_LOG(ERR, "fill_window_ms must be between 1 and %u",
+			MLX5_FILL_WINDOW_MS_MAX);
+		rte_errno = EINVAL;
+		return -rte_errno;
+	}
+	if (config->fill_headroom == 0)
+		config->fill_headroom = MLX5_FILL_HEADROOM_DEFAULT;
+	if (config->fill_headroom < 100 ||
+	    config->fill_headroom > MLX5_FILL_HEADROOM_MAX) {
+		DRV_LOG(ERR, "fill_headroom must be between 100 and %u (percent)",
+			MLX5_FILL_HEADROOM_MAX);
+		rte_errno = EINVAL;
+		return -rte_errno;
+	}
 	DRV_LOG(INFO, "FILL-ring Rx enabled with credits: each Rx queue is"
-		" entitled to %u buffers and keeps at least %u posted",
-		config->fill_budget, config->fill_floor);
+		" entitled to %u buffers and keeps at least %u posted;"
+		" window %u ms, headroom %u%%",
+		config->fill_budget, config->fill_floor,
+		config->fill_window_ms, config->fill_headroom);
 	return 0;
 }
 
@@ -2121,6 +2163,8 @@ mlx5_args(struct mlx5_dev_config *config, struct rte_devargs *devargs)
 		MLX5_FILL_BUDGET,
 		MLX5_FILL_DYN,
 		MLX5_FILL_FLOOR,
+		MLX5_FILL_WINDOW_MS,
+		MLX5_FILL_HEADROOM,
 		NULL,
 	};
 	struct rte_kvargs *kvlist;

@@ -25,11 +25,6 @@
 #define MLX5_FLOW_TUNNEL 10
 
 /* FILL-ring credits (fill_dyn): see mlx5_rxq_fill_credits(). */
-/* Budget wanted per packet of peak backlog, as a fraction. */
-#define MLX5_FILL_HEADROOM_NUM 3
-#define MLX5_FILL_HEADROOM_DEN 2
-/* Seconds in a window; a peak is remembered for one to two of them. */
-#define MLX5_FILL_WINDOW_S 10
 /* While bursts keep coming back full, count the backlog every this many. */
 #define MLX5_FILL_RECOUNT 8
 
@@ -173,6 +168,7 @@ struct mlx5_rxq_data {
 	uint16_t fill_entitled; /* Credits no other queue can ask back. */
 	uint16_t fill_owed; /* Credits paid to a debt and still posted. */
 	uint16_t fill_floor; /* The budget never goes below this. */
+	uint16_t fill_headroom; /* Budget per peak backlog, in percent. */
 	uint8_t fill_short; /* The last raise was cut short by the pool. */
 	uint16_t fill_peak[2]; /* Largest backlog: last and current window. */
 	uint8_t fill_polls; /* Bursts since the clock was last read. */

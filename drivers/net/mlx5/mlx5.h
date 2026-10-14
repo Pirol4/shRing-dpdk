@@ -278,6 +278,8 @@ struct mlx5_dev_config {
 	uint32_t fill_budget; /* Buffers each Rx queue keeps posted to the NIC. */
 	int fill_dyn; /* fill_budget is an entitlement; budgets follow the load. */
 	uint32_t fill_floor; /* Smallest budget of a queue when fill_dyn is set. */
+	uint32_t fill_window_ms; /* Length of a fill_dyn window. */
+	uint32_t fill_headroom; /* fill_dyn budget per peak backlog, percent. */
 };
 
 

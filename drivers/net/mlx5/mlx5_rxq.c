@@ -1772,8 +1772,9 @@ mlx5_rxq_new(struct rte_eth_dev *dev, uint16_t idx, uint16_t desc,
 		tmpl->rxq.fill_rng = (idx + 1) * 2654435761u;
 		tmpl->rxq.fill_budget = config->fill_floor;
 		tmpl->rxq.fill_held = config->fill_floor;
+		tmpl->rxq.fill_headroom = config->fill_headroom;
 		tmpl->rxq.fill_window_tsc =
-			rte_get_tsc_hz() * MLX5_FILL_WINDOW_S;
+			rte_get_tsc_hz() * config->fill_window_ms / 1000;
 		tmpl->rxq.fill_pool = &priv->fill_pool;
 		__atomic_add_fetch(&priv->fill_pool,
 				   config->fill_budget - config->fill_floor,
