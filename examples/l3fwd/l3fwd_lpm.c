@@ -240,6 +240,7 @@ lpm_main_loop(__rte_unused void *dummy)
 				continue;
 			} else {
 				qconf->rx_cycles = (uint64_t) (qconf->rx_cycles + _diff_tsc);
+				qconf->rx_pkts += nb_rx;
 			}
 
 #if defined RTE_ARCH_X86 || defined __ARM_NEON \
@@ -250,6 +251,7 @@ lpm_main_loop(__rte_unused void *dummy)
 			l3fwd_lpm_no_opt_send_packets(nb_rx, pkts_burst,
 							portid, qconf);
 #endif /* X86 */
+			qconf->fwd_cycles += rte_rdtsc() - start_tsc;
 		}
 		if (!valid_measurements && (cur_tsc - total_start_tsc) > threshold) {
 			RTE_LOG(INFO, L3FWD, "[+] reseting counters on lcore %u\n", lcore_id);
@@ -257,6 +259,8 @@ lpm_main_loop(__rte_unused void *dummy)
 			qconf->rx_cycles_idle = 0;
 			qconf->rx_cycles = 0;
 			qconf->tx_cycles = 0;
+			qconf->rx_pkts = 0;
+			qconf->fwd_cycles = 0;
 			total_tsc = 0;
 			total_start_tsc = rte_rdtsc();
 			valid_measurements = true;
@@ -290,6 +294,16 @@ lpm_main_loop(__rte_unused void *dummy)
 	       total_tsc,
 	       (uint64_t)(rte_get_tsc_hz() / 1E6),
 	       stats.oerrors, stats.ierrors, stats.rx_nombuf, stats.rx_contention);
+	/*
+	 * Cost per packet: Rx burst alone (the driver path) and Rx burst
+	 * through lookup and Tx enqueue, both over non-empty bursts only, so
+	 * idle polling and the gaps between traffic windows do not count.
+	 */
+	printf("CYCLES lcore %u: pkts=%" PRIu64 " rx_cyc/pkt=%.1f fwd_cyc/pkt=%.1f tsc_mhz=%" PRIu64 "\n",
+	       lcore_id, qconf->rx_pkts,
+	       qconf->rx_pkts ? (double)qconf->rx_cycles / qconf->rx_pkts : 0.0,
+	       qconf->rx_pkts ? (double)qconf->fwd_cycles / qconf->rx_pkts : 0.0,
+	       (uint64_t)(rte_get_tsc_hz() / 1E6));
 
 	return 0;
 }

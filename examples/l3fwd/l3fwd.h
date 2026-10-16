@@ -81,6 +81,8 @@ struct lcore_conf {
 	uint64_t     rx_cycles_idle; /**< used for RX idle processing */
 	uint64_t     tx_cycles; /**< used for TX processing */
 	uint64_t     lookup_cycles; /**< used for lookup processing */
+	uint64_t     rx_pkts; /**< packets received, same span as rx_cycles */
+	uint64_t     fwd_cycles; /**< non-empty Rx burst through send_packets */
 #define NB_MEM_CALLS (256 * 256 * 16)
 #define NB_MEM_CALLS_MASK (NB_MEM_CALLS- 1)
 	uint64_t mem_calls[NB_MEM_CALLS];

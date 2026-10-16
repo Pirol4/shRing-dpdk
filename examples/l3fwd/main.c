@@ -141,6 +141,9 @@ static struct rte_eth_conf port_conf = {
 };
 
 static struct rte_mempool *pktmbuf_pool[RTE_MAX_ETHPORTS][NB_SOCKETS];
+/* Common-ring positions of each pool when the lcores were launched. */
+static uint32_t pool_ring_get0[RTE_MAX_ETHPORTS][NB_SOCKETS];
+static uint32_t pool_ring_put0[RTE_MAX_ETHPORTS][NB_SOCKETS];
 static uint8_t lkp_per_socket[NB_SOCKETS];
 
 struct l3fwd_lkp_mode {
@@ -654,6 +657,71 @@ static const struct option lgopts[] = {
 	nports*n_tx_queue*nb_txd +		\
 	nb_lcores*MEMPOOL_CACHE_SIZE),		\
 	(unsigned)8192)
+
+/*
+ * The per-lcore caches of an mbuf pool are invisible to other lcores; only
+ * a cache that runs empty or overflows reaches the pool's common ring, the
+ * one place where lcores synchronise. The ring's tails count every object
+ * that went through it, so their difference over a run is that traffic,
+ * read without the cost of RTE_LIBRTE_MEMPOOL_DEBUG. Only for the ring
+ * mempool drivers; tail sits at the same offset for every sync type.
+ */
+static struct rte_ring *
+pool_common_ring(const struct rte_mempool *mp)
+{
+	const struct rte_mempool_ops *ops = rte_mempool_get_ops(mp->ops_index);
+
+	if (strncmp(ops->name, "ring_", 5) != 0)
+		return NULL;
+	return mp->pool_data;
+}
+
+static void
+pool_ring_mark(void)
+{
+	unsigned int p, s;
+
+	for (p = 0; p < RTE_MAX_ETHPORTS; p++)
+		for (s = 0; s < NB_SOCKETS; s++) {
+			struct rte_ring *r;
+
+			if (pktmbuf_pool[p][s] == NULL)
+				continue;
+			r = pool_common_ring(pktmbuf_pool[p][s]);
+			if (r == NULL)
+				continue;
+			pool_ring_get0[p][s] = r->cons.tail;
+			pool_ring_put0[p][s] = r->prod.tail;
+		}
+}
+
+/* Wraps after 2^32 objects each way, minutes of line rate at worst. */
+static void
+pool_ring_report(void)
+{
+	unsigned int p, s;
+
+	for (p = 0; p < RTE_MAX_ETHPORTS; p++)
+		for (s = 0; s < NB_SOCKETS; s++) {
+			const struct rte_mempool *mp = pktmbuf_pool[p][s];
+			struct rte_ring *r;
+
+			if (mp == NULL)
+				continue;
+			r = pool_common_ring(mp);
+			if (r == NULL) {
+				printf("MEMPOOL %s: ops %s, common ring not read\n",
+				       mp->name,
+				       rte_mempool_get_ops(mp->ops_index)->name);
+				continue;
+			}
+			printf("MEMPOOL %s: common ring get=%u put=%u objects, "
+			       "cache %u per lcore, %u in pool\n", mp->name,
+			       r->cons.tail - pool_ring_get0[p][s],
+			       r->prod.tail - pool_ring_put0[p][s],
+			       mp->cache_size, rte_mempool_avail_count(mp));
+		}
+}
 
 /* Parse the argument given in the command line of the application */
 static int
@@ -1410,6 +1478,7 @@ main(int argc, char **argv)
 	check_all_ports_link_status(enabled_port_mask);
 
 	ret = 0;
+	pool_ring_mark();
 	/* launch per-lcore init on every lcore */
 	rte_eal_mp_remote_launch(l3fwd_lkp.main_loop, NULL, CALL_MAIN);
 	if (evt_rsrc->enabled) {
@@ -1441,6 +1510,8 @@ main(int argc, char **argv)
 
 	} else {
 		rte_eal_mp_wait_lcore();
+		/* Before the ports stop and hand their posted buffers back. */
+		pool_ring_report();
 
 		RTE_ETH_FOREACH_DEV(portid) {
 			if ((enabled_port_mask & (1 << portid)) == 0)
