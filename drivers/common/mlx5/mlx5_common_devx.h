@@ -5,6 +5,8 @@
 #ifndef RTE_PMD_MLX5_COMMON_DEVX_H_
 #define RTE_PMD_MLX5_COMMON_DEVX_H_
 
+#include <rte_spinlock.h>
+
 #include "mlx5_devx_cmds.h"
 
 // TODO: seperate to read-only and shared cachelines
@@ -15,6 +17,8 @@ struct rmp_shared {
 	uint32_t rq_pi;
 	uint16_t consumed_strd;
 	uint16_t head; /* bounces between cores */
+	/* rmp_fix=1: one lcore at a time clears bitmap words and moves head. */
+	rte_spinlock_t advance_lock;
 
 	/* start new cacheline here */
 	uint64_t *uwbmp __rte_cache_aligned; // used wqe bitmap

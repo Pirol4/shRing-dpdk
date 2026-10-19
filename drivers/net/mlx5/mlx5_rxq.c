@@ -1762,21 +1762,27 @@ mlx5_rxq_new(struct rte_eth_dev *dev, uint16_t idx, uint16_t desc,
 	tmpl->rxq.uar_lock_cq = &priv->sh->uar_lock_cq;
 #endif
 	tmpl->rxq.idx = idx;
+	tmpl->rxq.rmp_fix = config->rmp_en && config->rmp_fix;
 	if (config->fill_en && config->fill_dyn) {
 		/*
 		 * The queue starts at the floor and leaves the rest of its
-		 * entitlement in the pool, for whichever queue needs it.
+		 * entitlement in its group's pool, for whichever queue needs
+		 * it. Groups are runs of consecutive queues, as l3fwd's lcores.
 		 */
+		const unsigned int group = idx * config->fill_groups /
+					   RTE_MAX(priv->rxqs_n, 1u);
+
 		tmpl->rxq.fill_floor = config->fill_floor;
 		tmpl->rxq.fill_entitled = config->fill_budget;
-		tmpl->rxq.fill_rng = (idx + 1) * 2654435761u;
+		tmpl->rxq.fill_reserve = config->fill_reserve;
+		tmpl->rxq.fill_group = group;
 		tmpl->rxq.fill_budget = config->fill_floor;
 		tmpl->rxq.fill_held = config->fill_floor;
 		tmpl->rxq.fill_headroom = config->fill_headroom;
 		tmpl->rxq.fill_window_tsc =
 			rte_get_tsc_hz() * config->fill_window_ms / 1000;
-		tmpl->rxq.fill_pool = &priv->fill_pool;
-		__atomic_add_fetch(&priv->fill_pool,
+		tmpl->rxq.fill_pool = &priv->fill_pools[group].credits;
+		__atomic_add_fetch(tmpl->rxq.fill_pool,
 				   config->fill_budget - config->fill_floor,
 				   __ATOMIC_RELAXED);
 	}
@@ -1893,9 +1899,13 @@ mlx5_rxq_release(struct rte_eth_dev *dev, uint16_t idx)
 	if (!__atomic_load_n(&rxq_ctrl->refcnt, __ATOMIC_RELAXED)) {
 		if (rxq_ctrl->type == MLX5_RXQ_TYPE_STANDARD)
 			mlx5_mr_btree_free(&rxq_ctrl->rxq.mr_ctrl.cache_bh);
-		/* The queue takes its whole entitlement out with it. */
+		/*
+		 * The queue takes its whole entitlement out with it, from its
+		 * group's pool: credits can move between groups, so one pool
+		 * may end below zero and another above until every queue is out.
+		 */
 		if (rxq_ctrl->rxq.fill_pool != NULL)
-			__atomic_sub_fetch(&priv->fill_pool,
+			__atomic_sub_fetch(rxq_ctrl->rxq.fill_pool,
 					   (int32_t)priv->config.fill_budget -
 					   rxq_ctrl->rxq.fill_held,
 					   __ATOMIC_RELAXED);

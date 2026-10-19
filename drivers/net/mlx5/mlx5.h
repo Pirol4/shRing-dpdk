@@ -213,6 +213,9 @@ struct mlx5_lro_config {
  *  - Device capabilities,
  *  - User device parameters disabled features.
  */
+/* Most fill_dyn credit pools per port (fill_groups). */
+#define MLX5_FILL_GROUPS_MAX 8
+
 struct mlx5_dev_config {
 	unsigned int hw_csum:1; /* Checksum offload is supported. */
 	unsigned int hw_vlan_strip:1; /* VLAN stripping is supported. */
@@ -274,12 +277,16 @@ struct mlx5_dev_config {
 	struct mlx5_lro_config lro; /* LRO configuration. */
 	int rmp_en;
 	uint32_t rqs_per_rmp;
+	int rmp_fix; /* shRing with its head advance serialised (19.25). */
 	int fill_en; /* Rx queues keep a budget of posted buffers, not a full ring. */
 	uint32_t fill_budget; /* Buffers each Rx queue keeps posted to the NIC. */
 	int fill_dyn; /* fill_budget is an entitlement; budgets follow the load. */
 	uint32_t fill_floor; /* Smallest budget of a queue when fill_dyn is set. */
 	uint32_t fill_window_ms; /* Length of a fill_dyn window. */
 	uint32_t fill_headroom; /* fill_dyn budget per peak backlog, percent. */
+	uint32_t fill_groups; /* fill_dyn credit pools, one per group of queues. */
+	uint32_t fill_reserve; /* Credits only a queue below its entitlement takes. */
+	int fill_reserve_set; /* fill_reserve was given (0 is a valid value). */
 };
 
 
@@ -1346,7 +1353,13 @@ struct mlx5_priv {
 	/* RX/TX queues. */
 	unsigned int rxqs_n; /* RX queues array size. */
 	unsigned int txqs_n; /* TX queues array size. */
-	int32_t fill_pool; /* FILL-ring credits that no Rx queue holds (atomic). */
+	/*
+	 * FILL-ring credits no Rx queue holds (atomic), one pool per group of
+	 * queues (fill_groups), each on its own cache line.
+	 */
+	struct {
+		int32_t credits;
+	} __rte_cache_aligned fill_pools[MLX5_FILL_GROUPS_MAX];
 	struct mlx5_rxq_data *(*rxqs)[]; /* RX queues. */
 	struct mlx5_txq_data *(*txqs)[]; /* TX queues. */
 	struct rte_mempool *mprq_mp; /* Mempool for Multi-Packet RQ. */

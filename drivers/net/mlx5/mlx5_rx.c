@@ -1192,24 +1192,26 @@ mlx5_rxq_fill_pending(struct mlx5_rxq_data *rxq, uint16_t max)
 }
 
 /**
- * Take credits from the pool of the port.
+ * Take credits from one credit pool, leaving at least `keep` in it.
  *
  * @param pool
  *   Pointer to the pool.
  * @param want
  *   Credits wanted.
+ * @param keep
+ *   Credits the pool must keep (its reserve, or 0).
  *
  * @return
  *   Credits taken, possibly 0.
  */
 static uint16_t
-mlx5_fill_pool_take(int32_t *pool, uint16_t want)
+mlx5_fill_pool_take(int32_t *pool, uint16_t want, int32_t keep)
 {
 	int32_t avail = __atomic_load_n(pool, __ATOMIC_RELAXED);
 	int32_t got;
 
 	do {
-		got = RTE_MIN((int32_t)want, avail);
+		got = RTE_MIN((int32_t)want, avail - keep);
 		if (got <= 0)
 			return 0;
 	} while (!__atomic_compare_exchange_n(pool, &avail, avail - got, 1,
@@ -1219,7 +1221,47 @@ mlx5_fill_pool_take(int32_t *pool, uint16_t want)
 }
 
 /**
- * Ask a borrower to give credits back to the pool.
+ * Take credits for a queue: from its group's pool first, then from the other
+ * groups' in turn.
+ *
+ * @param rxq
+ *   Pointer to RX queue structure.
+ * @param want
+ *   Credits wanted.
+ * @param keep
+ *   Credits every pool must keep (the reserve, for growth beyond the
+ *   entitlement; 0 below it).
+ *
+ * @return
+ *   Credits taken, possibly 0.
+ */
+static uint16_t
+mlx5_rxq_fill_take(struct mlx5_rxq_data *rxq, uint16_t want, int32_t keep)
+{
+	struct mlx5_priv *priv =
+		container_of(rxq, struct mlx5_rxq_ctrl, rxq)->priv;
+	const unsigned int groups = priv->config.fill_groups;
+	uint16_t got = 0;
+	unsigned int i;
+
+	for (i = 0; i != groups && got < want; ++i) {
+		const unsigned int g = (rxq->fill_group + i) % groups;
+
+		got += mlx5_fill_pool_take(&priv->fill_pools[g].credits,
+					   want - got, keep);
+	}
+	return got;
+}
+
+/**
+ * Ask the largest borrower to give credits back to the pool.
+ *
+ * The largest borrower is the queue holding the most credits beyond its
+ * entitlement; ties go to the first one after the asker, so equal borrowers
+ * are asked in turn. (A borrower used to be drawn by a lottery
+ * weighted by what it borrowed; with equal entitlements the draw picked the
+ * same queue almost always, and a deterministic rule is simpler to reason
+ * about; CLAUDE.md 19.25.)
  *
  * @param rxq
  *   Pointer to RX queue structure: a queue below its entitlement.
@@ -1231,47 +1273,36 @@ mlx5_rxq_fill_reclaim(struct mlx5_rxq_data *rxq, uint16_t want)
 {
 	struct mlx5_priv *priv =
 		container_of(rxq, struct mlx5_rxq_ctrl, rxq)->priv;
-	uint32_t borrowed[2] = { 0, 0 };
-	uint32_t draw = 0;
-	unsigned int pass;
+	struct mlx5_rxq_data *largest = NULL;
+	uint32_t largest_over = 0;
 	unsigned int i;
+	int32_t debt;
 
-	/* First pass: how much is borrowed. Second: whose credit is drawn. */
-	for (pass = 0; pass != 2; ++pass) {
-		for (i = 0; i != priv->rxqs_n; ++i) {
-			struct mlx5_rxq_data *other = (*priv->rxqs)[i];
-			uint32_t over;
-			int32_t debt;
+	for (i = 1; i <= priv->rxqs_n; ++i) {
+		struct mlx5_rxq_data *other =
+			(*priv->rxqs)[(rxq->idx + i) % priv->rxqs_n];
 
-			if (other == NULL || other == rxq ||
-			    other->fill_pool == NULL ||
-			    other->fill_held <= other->fill_entitled)
-				continue;
-			over = other->fill_held - other->fill_entitled;
-			borrowed[pass] += over;
-			if (pass == 0 || borrowed[1] <= draw)
-				continue;
-			/* Asking twice for the same credits is one debt. */
-			want = RTE_MIN((uint32_t)want, over);
-			debt = __atomic_load_n(&other->fill_debt,
-					       __ATOMIC_RELAXED);
-			while (debt < want &&
-			       !__atomic_compare_exchange_n(&other->fill_debt,
-							    &debt, want, 1,
-							    __ATOMIC_RELAXED,
-							    __ATOMIC_RELAXED))
-				;
-			++rxq->fill_stats.reclaims;
-			return;
+		if (other == NULL || other == rxq ||
+		    other->fill_pool == NULL ||
+		    other->fill_held <= other->fill_entitled)
+			continue;
+		const uint32_t over = other->fill_held - other->fill_entitled;
+
+		if (over > largest_over) {
+			largest = other;
+			largest_over = over;
 		}
-		if (borrowed[0] == 0)
-			return;
-		/* xorshift32 */
-		rxq->fill_rng ^= rxq->fill_rng << 13;
-		rxq->fill_rng ^= rxq->fill_rng >> 17;
-		rxq->fill_rng ^= rxq->fill_rng << 5;
-		draw = rxq->fill_rng % borrowed[0];
 	}
+	if (largest == NULL)
+		return;
+	/* Asking twice for the same credits is one debt. */
+	want = RTE_MIN((uint32_t)want, largest_over);
+	debt = __atomic_load_n(&largest->fill_debt, __ATOMIC_RELAXED);
+	while (debt < want &&
+	       !__atomic_compare_exchange_n(&largest->fill_debt, &debt, want, 1,
+					    __ATOMIC_RELAXED, __ATOMIC_RELAXED))
+		;
+	++rxq->fill_stats.reclaims;
 }
 
 /**
@@ -1330,8 +1361,18 @@ mlx5_rxq_fill_rebudget(struct mlx5_rxq_data *rxq, bool saturated,
 		 */
 		const uint16_t back = RTE_MIN(want, rxq->fill_held - budget -
 						    rxq->fill_owed);
-		const uint16_t got = mlx5_fill_pool_take(rxq->fill_pool,
-							 want - back);
+		/*
+		 * Up to its entitlement a queue may empty a pool; beyond it,
+		 * every pool keeps its reserve for queues that are below theirs.
+		 */
+		const uint32_t after_back = (uint32_t)budget + back;
+		const uint16_t below = after_back < rxq->fill_entitled ?
+			RTE_MIN((uint32_t)(want - back),
+				rxq->fill_entitled - after_back) : 0;
+		uint16_t got = mlx5_rxq_fill_take(rxq, below, 0);
+
+		got += mlx5_rxq_fill_take(rxq, want - back - got,
+					  rxq->fill_reserve);
 
 		rxq->fill_held += got;
 		budget += back + got;
@@ -1560,6 +1601,62 @@ static inline bool after(uint32_t seq1, uint32_t seq2, uint32_t mask) {
 		((seq1 + mask - seq2) >= THRESHOLD);
 }
 
+/**
+ * Move shRing's shared head past every fully consumed block, one lcore at a
+ * time (rmp_fix=1).
+ *
+ * The published advance (below, in mlx5_rx_burst_rmp) lets any lcore clear a
+ * block's bitmap word before its CAS on head, and ring the doorbell with a
+ * value it read after the CAS. An lcore stopped between its bitmap load and
+ * its clear for longer than the NIC takes to come round the ring erases the
+ * bits of the block's next lap, and one stopped before its doorbell write
+ * lowers the producer index the NIC sees; either stops the ring for good.
+ * Here the lcore that wins the trylock clears, moves head, and rings once,
+ * in that order, and an lcore that loses it leaves the work to the winner.
+ *
+ * @param rxq
+ *   Pointer to RX queue structure.
+ * @param idx
+ *   WQE index of the last completion this burst read.
+ * @param wqe_cnt
+ *   Ring size minus one.
+ */
+static __rte_noinline void
+mlx5_rmp_advance_serial(struct mlx5_rxq_data *rxq, uint16_t idx,
+			unsigned int wqe_cnt)
+{
+	struct rmp_shared *sh = rxq->rmpsh;
+	uint16_t head;
+	unsigned int head_idx;
+	bool moved = false;
+
+	if (!rte_spinlock_trylock(&sh->advance_lock)) {
+		rxq->stats.contention++;
+		return;
+	}
+	head = __atomic_load_n(&sh->head, __ATOMIC_RELAXED);
+	head_idx = head & wqe_cnt;
+	while (after(idx, head_idx + THRESHOLD, 1 + wqe_cnt)) {
+		/* head_idx ends a block: the next word is the next block. */
+		uint64_t *word = &sh->uwbmp[((head_idx + 1) & wqe_cnt) >> 6];
+
+		if (__atomic_load_n(word, __ATOMIC_ACQUIRE) != UINT64_MAX)
+			break;
+		/* No lcore sets these bits again before the doorbell. */
+		__atomic_store_n(word, 0, __ATOMIC_RELAXED);
+		head += THRESHOLD;
+		head_idx = head & wqe_cnt;
+		moved = true;
+	}
+	if (moved) {
+		__atomic_store_n(&sh->head, head, __ATOMIC_RELEASE);
+		/* The cleared words are visible before the NIC reuses them. */
+		rte_io_wmb();
+		*rxq->rq_db = rte_cpu_to_be_32(head);
+	}
+	rte_spinlock_unlock(&sh->advance_lock);
+}
+
 uint16_t
 mlx5_rx_burst_rmp(void *dpdk_rxq, struct rte_mbuf **pkts, uint16_t pkts_n)
 {
@@ -1708,6 +1805,13 @@ mlx5_rx_burst_rmp(void *dpdk_rxq, struct rte_mbuf **pkts, uint16_t pkts_n)
 	/////////////////////////////////////////////////////////////////////////////////
 	// once 64 in-sequence packets are received, ring doorbell and zeroize bitmap
 	////////////////////////////////////////////////////////////////////////////////
+	if (rxq->rmp_fix) {
+		mlx5_rmp_advance_serial(rxq, idx, wqe_cnt);
+#ifdef MLX5_PMD_SOFT_COUNTERS
+		rxq->stats.ipackets += i;
+#endif
+		return i;
+	}
 	int head = rxq->rmpsh->head;
 	int head_idx = head & wqe_cnt;
 	uint64_t blk, mask;

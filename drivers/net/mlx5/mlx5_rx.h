@@ -160,10 +160,12 @@ struct mlx5_rxq_data {
 	struct mlx5_eth_rxseg rxseg[MLX5_MAX_RXQ_NSEG];
 	struct rmp_shared *rmpsh;
 	/* FILL-ring credits; fill_pool is NULL when the budget is static. */
-	int32_t *fill_pool; /* Credits no queue of the port holds (atomic). */
+	int32_t *fill_pool; /* Credits of this queue's group no queue holds (atomic). */
 	uint64_t fill_window_end; /* TSC at which the current window closes. */
 	uint64_t fill_window_tsc; /* Length of a window. */
-	uint32_t fill_rng; /* State of the generator that draws a loser. */
+	uint16_t fill_reserve; /* Pool credits only a queue below entitlement takes. */
+	uint8_t fill_group; /* Index of this queue's credit pool. */
+	uint8_t rmp_fix; /* shRing path with its head advance serialised. */
 	uint16_t fill_entitled; /* Credits no other queue can ask back. */
 	uint16_t fill_owed; /* Credits paid to a debt and still posted. */
 	uint16_t fill_floor; /* The budget never goes below this. */

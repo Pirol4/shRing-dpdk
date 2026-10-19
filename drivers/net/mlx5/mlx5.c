@@ -126,6 +126,16 @@
 #define MLX5_RMP_EN "rmp_en"
 
 /*
+ * Device parameter for shRing (rmp_en) with its head advance serialised: one
+ * lcore at a time, by trylock, clears the bitmap word of a full block, moves
+ * head and rings the doorbell, in that order. The published code lets an
+ * lcore delayed between its bitmap load and its clear erase the next lap's
+ * bits, and a delayed winner ring a stale doorbell; either stops the shared
+ * ring for good (CLAUDE.md 19.25).
+ */
+#define MLX5_RMP_FIX "rmp_fix"
+
+/*
  * Device parameter to enable the FILL-ring Rx path: an Rx queue keeps only
  * fill_budget buffers posted to the NIC instead of filling its whole ring,
  * which decouples the ring size from the I/O working set.
@@ -160,6 +170,23 @@
 #define MLX5_FILL_HEADROOM "fill_headroom"
 #define MLX5_FILL_HEADROOM_DEFAULT 150
 #define MLX5_FILL_HEADROOM_MAX 1000
+
+/*
+ * Number of fill_dyn credit pools: queues are split into this many groups of
+ * consecutive indexes, each taking from its own pool first and from the other
+ * groups' only when its own is empty, so the common case shares a cache line
+ * among a group's lcores instead of all of them.
+ */
+#define MLX5_FILL_GROUPS "fill_groups"
+
+/*
+ * Credits a pool keeps for queues below their entitlement: a queue growing
+ * beyond fill_budget cannot take the last fill_reserve credits of a pool, so
+ * a short backlog on another queue is served from the reserve instead of a
+ * reclaim from the borrower.
+ */
+#define MLX5_FILL_RESERVE "fill_reserve"
+#define MLX5_FILL_RESERVE_DEFAULT 64
 
 /*
  * Device parameter to specify skew in nanoseconds on Tx datapath,
@@ -1892,6 +1919,8 @@ mlx5_args_check(const char *key, const char *val, void *opaque)
 		config->cqe_comp_fmt = tmp;
 	} else if (strcmp(MLX5_RMP_EN, key) == 0) {
 		config->rmp_en = !!tmp;
+	} else if (strcmp(MLX5_RMP_FIX, key) == 0) {
+		config->rmp_fix = !!tmp;
 	} else if (strcmp(MLX5_RQ_PER_RMP, key) == 0) {
 		config->rqs_per_rmp = tmp;
 	} else if (strcmp(MLX5_FILL_EN, key) == 0) {
@@ -1906,6 +1935,11 @@ mlx5_args_check(const char *key, const char *val, void *opaque)
 		config->fill_window_ms = tmp;
 	} else if (strcmp(MLX5_FILL_HEADROOM, key) == 0) {
 		config->fill_headroom = tmp;
+	} else if (strcmp(MLX5_FILL_GROUPS, key) == 0) {
+		config->fill_groups = tmp;
+	} else if (strcmp(MLX5_FILL_RESERVE, key) == 0) {
+		config->fill_reserve = tmp;
+		config->fill_reserve_set = 1;
 	} else if (strcmp(MLX5_RXQ_PKT_PAD_EN, key) == 0) {
 		config->hw_padding = !!tmp;
 	} else if (strcmp(MLX5_RX_MPRQ_EN, key) == 0) {
@@ -2034,9 +2068,16 @@ mlx5_args_check(const char *key, const char *val, void *opaque)
 static int
 mlx5_fill_args_validate(struct mlx5_dev_config *config)
 {
+	if (config->rmp_fix && !config->rmp_en) {
+		DRV_LOG(ERR, "rmp_fix requires rmp_en");
+		rte_errno = EINVAL;
+		return -rte_errno;
+	}
 	if (!config->fill_dyn &&
-	    (config->fill_window_ms != 0 || config->fill_headroom != 0)) {
-		DRV_LOG(ERR, "fill_window_ms and fill_headroom require fill_dyn");
+	    (config->fill_window_ms != 0 || config->fill_headroom != 0 ||
+	     config->fill_groups != 0 || config->fill_reserve_set)) {
+		DRV_LOG(ERR, "fill_window_ms, fill_headroom, fill_groups and"
+			     " fill_reserve require fill_dyn");
 		rte_errno = EINVAL;
 		return -rte_errno;
 	}
@@ -2098,11 +2139,27 @@ mlx5_fill_args_validate(struct mlx5_dev_config *config)
 		rte_errno = EINVAL;
 		return -rte_errno;
 	}
+	if (config->fill_groups == 0)
+		config->fill_groups = 1;
+	if (config->fill_groups > MLX5_FILL_GROUPS_MAX) {
+		DRV_LOG(ERR, "fill_groups must be between 1 and %u",
+			MLX5_FILL_GROUPS_MAX);
+		rte_errno = EINVAL;
+		return -rte_errno;
+	}
+	if (!config->fill_reserve_set)
+		config->fill_reserve = MLX5_FILL_RESERVE_DEFAULT;
+	if (config->fill_reserve > UINT16_MAX) {
+		DRV_LOG(ERR, "fill_reserve must be at most %u", UINT16_MAX);
+		rte_errno = EINVAL;
+		return -rte_errno;
+	}
 	DRV_LOG(INFO, "FILL-ring Rx enabled with credits: each Rx queue is"
 		" entitled to %u buffers and keeps at least %u posted;"
-		" window %u ms, headroom %u%%",
+		" window %u ms, headroom %u%%; %u credit pool(s), reserve %u",
 		config->fill_budget, config->fill_floor,
-		config->fill_window_ms, config->fill_headroom);
+		config->fill_window_ms, config->fill_headroom,
+		config->fill_groups, config->fill_reserve);
 	return 0;
 }
 
@@ -2158,6 +2215,7 @@ mlx5_args(struct mlx5_dev_config *config, struct rte_devargs *devargs)
 		MLX5_SYS_MEM_EN,
 		MLX5_DECAP_EN,
 		MLX5_RMP_EN,
+		MLX5_RMP_FIX,
 		MLX5_RQ_PER_RMP,
 		MLX5_FILL_EN,
 		MLX5_FILL_BUDGET,
@@ -2165,6 +2223,8 @@ mlx5_args(struct mlx5_dev_config *config, struct rte_devargs *devargs)
 		MLX5_FILL_FLOOR,
 		MLX5_FILL_WINDOW_MS,
 		MLX5_FILL_HEADROOM,
+		MLX5_FILL_GROUPS,
+		MLX5_FILL_RESERVE,
 		NULL,
 	};
 	struct rte_kvargs *kvlist;
