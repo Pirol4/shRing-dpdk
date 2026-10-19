@@ -1626,10 +1626,20 @@ mlx5_rmp_advance_serial(struct mlx5_rxq_data *rxq, uint16_t idx,
 			unsigned int wqe_cnt)
 {
 	struct rmp_shared *sh = rxq->rmpsh;
-	uint16_t head;
-	unsigned int head_idx;
+	uint16_t head = __atomic_load_n(&sh->head, __ATOMIC_RELAXED);
+	unsigned int head_idx = head & wqe_cnt;
 	bool moved = false;
 
+	/*
+	 * Read-only check first, as the published code does before its CAS:
+	 * reach for the lock only when the next block is full. Trying it at
+	 * every burst bounced its line between all lcores (2026-10-19 smoke:
+	 * 23.6 M failed tries in 10 s, Rx cost 1,490 cycles per packet).
+	 */
+	if (!after(idx, head_idx + THRESHOLD, 1 + wqe_cnt) ||
+	    __atomic_load_n(&sh->uwbmp[((head_idx + 1) & wqe_cnt) >> 6],
+			    __ATOMIC_RELAXED) != UINT64_MAX)
+		return;
 	if (!rte_spinlock_trylock(&sh->advance_lock)) {
 		rxq->stats.contention++;
 		return;
