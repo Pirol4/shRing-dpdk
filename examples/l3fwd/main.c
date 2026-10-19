@@ -141,9 +141,16 @@ static struct rte_eth_conf port_conf = {
 };
 
 static struct rte_mempool *pktmbuf_pool[RTE_MAX_ETHPORTS][NB_SOCKETS];
-/* Common-ring positions of each pool when the lcores were launched. */
-static uint32_t pool_ring_get0[RTE_MAX_ETHPORTS][NB_SOCKETS];
-static uint32_t pool_ring_put0[RTE_MAX_ETHPORTS][NB_SOCKETS];
+/* One mbuf pool per group of Rx lcores when L3FWD_MEMPOOL_GROUPS > 1. */
+#define L3FWD_MAX_POOL_GROUPS 8
+static struct rte_mempool *group_pool[RTE_MAX_ETHPORTS][L3FWD_MAX_POOL_GROUPS];
+/* Every mbuf pool, with its common-ring positions when the lcores launched. */
+static struct {
+	struct rte_mempool *mp;
+	uint32_t get0;
+	uint32_t put0;
+} pool_list[RTE_MAX_ETHPORTS * (NB_SOCKETS + L3FWD_MAX_POOL_GROUPS)];
+static unsigned int pool_list_n;
 static uint8_t lkp_per_socket[NB_SOCKETS];
 
 struct l3fwd_lkp_mode {
@@ -679,48 +686,46 @@ pool_common_ring(const struct rte_mempool *mp)
 static void
 pool_ring_mark(void)
 {
-	unsigned int p, s;
+	unsigned int i;
 
-	for (p = 0; p < RTE_MAX_ETHPORTS; p++)
-		for (s = 0; s < NB_SOCKETS; s++) {
-			struct rte_ring *r;
+	for (i = 0; i < pool_list_n; i++) {
+		struct rte_ring *r = pool_common_ring(pool_list[i].mp);
 
-			if (pktmbuf_pool[p][s] == NULL)
-				continue;
-			r = pool_common_ring(pktmbuf_pool[p][s]);
-			if (r == NULL)
-				continue;
-			pool_ring_get0[p][s] = r->cons.tail;
-			pool_ring_put0[p][s] = r->prod.tail;
-		}
+		if (r == NULL)
+			continue;
+		pool_list[i].get0 = r->cons.tail;
+		pool_list[i].put0 = r->prod.tail;
+	}
 }
 
-/* Wraps after 2^32 objects each way, minutes of line rate at worst. */
+/*
+ * Wraps after 2^32 objects each way, minutes of line rate at worst. A stack
+ * pool has no tails to read; the objects that reach its shared level are
+ * set by the per-lcore cache alone, so they equal a ring pool's under the
+ * same cache size and traffic.
+ */
 static void
 pool_ring_report(void)
 {
-	unsigned int p, s;
+	unsigned int i;
 
-	for (p = 0; p < RTE_MAX_ETHPORTS; p++)
-		for (s = 0; s < NB_SOCKETS; s++) {
-			const struct rte_mempool *mp = pktmbuf_pool[p][s];
-			struct rte_ring *r;
+	for (i = 0; i < pool_list_n; i++) {
+		const struct rte_mempool *mp = pool_list[i].mp;
+		struct rte_ring *r = pool_common_ring(mp);
 
-			if (mp == NULL)
-				continue;
-			r = pool_common_ring(mp);
-			if (r == NULL) {
-				printf("MEMPOOL %s: ops %s, common ring not read\n",
-				       mp->name,
-				       rte_mempool_get_ops(mp->ops_index)->name);
-				continue;
-			}
-			printf("MEMPOOL %s: common ring get=%u put=%u objects, "
+		if (r == NULL) {
+			printf("MEMPOOL %s: ops %s, common level not counted, "
 			       "cache %u per lcore, %u in pool\n", mp->name,
-			       r->cons.tail - pool_ring_get0[p][s],
-			       r->prod.tail - pool_ring_put0[p][s],
+			       rte_mempool_get_ops(mp->ops_index)->name,
 			       mp->cache_size, rte_mempool_avail_count(mp));
+			continue;
 		}
+		printf("MEMPOOL %s: common ring get=%u put=%u objects, "
+		       "cache %u per lcore, %u in pool\n", mp->name,
+		       r->cons.tail - pool_list[i].get0,
+		       r->prod.tail - pool_list[i].put0,
+		       mp->cache_size, rte_mempool_avail_count(mp));
+	}
 }
 
 /* Parse the argument given in the command line of the application */
@@ -965,6 +970,89 @@ mempool_cache_size(void)
 	return size;
 }
 
+/*
+ * Mempool driver: the default (ring_mp_mc, a FIFO common ring) unless the
+ * environment sets L3FWD_MEMPOOL_OPS, e.g. "stack" or "lf_stack": a LIFO
+ * shared level, so a buffer that overflows a cache is the next one out, still
+ * warm, instead of waiting behind every other free buffer (CLAUDE.md 19.24).
+ */
+static const char *
+mempool_ops(void)
+{
+	const char *env = getenv("L3FWD_MEMPOOL_OPS");
+
+	return env != NULL && *env != '\0' ? env : rte_mbuf_best_mempool_ops();
+}
+
+/*
+ * Number of mbuf pools per port: 1 (one per socket, stock l3fwd) unless the
+ * environment sets L3FWD_MEMPOOL_GROUPS; then the Rx lcores, in lcore order,
+ * are split into that many groups of consecutive lcores, each Rx queue takes
+ * its buffers from its lcore's group pool, and lcores of different groups
+ * never meet on a shared level. The mlx5 devarg fill_groups splits the credit
+ * pools the same way.
+ */
+static unsigned int
+mempool_groups(void)
+{
+	const char *env = getenv("L3FWD_MEMPOOL_GROUPS");
+	char *end;
+	unsigned long groups;
+
+	if (env == NULL || *env == '\0')
+		return 1;
+	groups = strtoul(env, &end, 10);
+	if (*end != '\0' || groups < 1 || groups > L3FWD_MAX_POOL_GROUPS)
+		rte_exit(EXIT_FAILURE, "L3FWD_MEMPOOL_GROUPS=%s: want 1-%u\n",
+			 env, L3FWD_MAX_POOL_GROUPS);
+	return groups;
+}
+
+/* Rank of an Rx lcore among the Rx lcores, and how many there are. */
+static unsigned int
+rx_lcore_rank(unsigned int lcore_id, unsigned int *count)
+{
+	unsigned int id, rank = 0, n = 0;
+
+	for (id = 0; id < RTE_MAX_LCORE; id++) {
+		if (rte_lcore_is_enabled(id) == 0 ||
+		    lcore_conf[id].n_rx_queue == 0)
+			continue;
+		if (id < lcore_id)
+			rank++;
+		n++;
+	}
+	*count = n;
+	return rank;
+}
+
+/* Pool group of an Rx lcore. */
+static unsigned int
+lcore_pool_group(unsigned int lcore_id)
+{
+	unsigned int n;
+	const unsigned int rank = rx_lcore_rank(lcore_id, &n);
+
+	return rank * mempool_groups() / RTE_MAX(n, 1u);
+}
+
+static struct rte_mempool *
+create_pool(const char *name, unsigned int nb_mbuf, int socketid)
+{
+	struct rte_mempool *mp = rte_pktmbuf_pool_create_by_ops(name, nb_mbuf,
+		mempool_cache_size(), 0, RTE_MBUF_DEFAULT_BUF_SIZE, socketid,
+		mempool_ops());
+
+	if (mp == NULL)
+		rte_exit(EXIT_FAILURE, "Cannot create mbuf pool %s (%u mbufs, ops %s):"
+			 " %s\n", name, nb_mbuf, mempool_ops(),
+			 rte_strerror(rte_errno));
+	pool_list[pool_list_n++].mp = mp;
+	printf("Allocated mbuf pool %s: %u mbufs, ops %s, cache %u per lcore\n",
+	       name, nb_mbuf, mempool_ops(), mempool_cache_size());
+	return mp;
+}
+
 int
 init_mem(uint16_t portid, unsigned int nb_mbuf)
 {
@@ -988,28 +1076,43 @@ init_mem(uint16_t portid, unsigned int nb_mbuf)
 				socketid, lcore_id, NB_SOCKETS);
 		}
 
-		if (pktmbuf_pool[portid][socketid] == NULL) {
+		if (mempool_groups() == 1 &&
+		    pktmbuf_pool[portid][socketid] == NULL) {
 			snprintf(s, sizeof(s), "mbuf_pool_%d:%d",
 				 portid, socketid);
 			pktmbuf_pool[portid][socketid] =
-				rte_pktmbuf_pool_create(s, nb_mbuf,
-					mempool_cache_size(), 0,
-					RTE_MBUF_DEFAULT_BUF_SIZE, socketid);
-			if (pktmbuf_pool[portid][socketid] == NULL)
-				rte_exit(EXIT_FAILURE,
-					"Cannot init mbuf pool on socket %d\n",
-					socketid);
-			else
-				printf("Allocated mbuf pool on socket %d, cache %u per lcore\n",
-					socketid, mempool_cache_size());
+				create_pool(s, nb_mbuf, socketid);
+		}
+		if (mempool_groups() > 1 && lcore_conf[lcore_id].n_rx_queue != 0) {
+			const unsigned int g = lcore_pool_group(lcore_id);
 
-			/* Setup LPM, EM(f.e Hash) or FIB. But, only once per
-			 * available socket.
-			 */
-			if (!lkp_per_socket[socketid]) {
-				l3fwd_lkp.setup(socketid);
-				lkp_per_socket[socketid] = 1;
+			if (group_pool[portid][g] == NULL) {
+				unsigned int n, id, members = 0;
+
+				for (id = 0; id < RTE_MAX_LCORE; id++)
+					if (rte_lcore_is_enabled(id) &&
+					    lcore_conf[id].n_rx_queue != 0 &&
+					    lcore_pool_group(id) == g)
+						members++;
+				rx_lcore_rank(lcore_id, &n);
+				/*
+				 * The group's share of the stock pool, plus
+				 * one ring of slack: rings, Tx queues and
+				 * caches all scale with its lcores.
+				 */
+				snprintf(s, sizeof(s), "mbuf_pool_%d:g%u",
+					 portid, g);
+				group_pool[portid][g] = create_pool(s,
+					nb_mbuf * members / RTE_MAX(n, 1u) +
+					nb_rxd, socketid);
 			}
+		}
+		/* Setup LPM, EM(f.e Hash) or FIB. But, only once per
+		 * available socket.
+		 */
+		if (!lkp_per_socket[socketid]) {
+			l3fwd_lkp.setup(socketid);
+			lkp_per_socket[socketid] = 1;
 		}
 		qconf = &lcore_conf[lcore_id];
 		qconf->ipv4_lookup_struct =
@@ -1295,7 +1398,14 @@ l3fwd_poll_resource_setup(void)
 
 			rxq_conf = dev_info.default_rxconf;
 			rxq_conf.offloads = port_conf.rxmode.offloads;
-			if (!per_port_pool)
+			if (mempool_groups() > 1)
+				ret = rte_eth_rx_queue_setup(portid, queueid,
+						nb_rxd, socketid,
+						&rxq_conf,
+						group_pool[per_port_pool ?
+							   portid : 0]
+							  [lcore_pool_group(lcore_id)]);
+			else if (!per_port_pool)
 				ret = rte_eth_rx_queue_setup(portid, queueid,
 						nb_rxd, socketid,
 						&rxq_conf,
