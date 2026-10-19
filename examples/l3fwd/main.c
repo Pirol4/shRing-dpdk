@@ -944,6 +944,27 @@ print_ethaddr(const char *name, const struct rte_ether_addr *eth_addr)
 	printf("%s%s", name, buf);
 }
 
+/*
+ * Per-lcore mempool cache size: MEMPOOL_CACHE_SIZE unless the environment sets
+ * L3FWD_MEMPOOL_CACHE (0 disables the cache), so a run can push every
+ * allocation and free through the pool's common ring.
+ */
+static unsigned int
+mempool_cache_size(void)
+{
+	const char *env = getenv("L3FWD_MEMPOOL_CACHE");
+	char *end;
+	unsigned long size;
+
+	if (env == NULL || *env == '\0')
+		return MEMPOOL_CACHE_SIZE;
+	size = strtoul(env, &end, 10);
+	if (*end != '\0' || size > RTE_MEMPOOL_CACHE_MAX_SIZE)
+		rte_exit(EXIT_FAILURE, "L3FWD_MEMPOOL_CACHE=%s: want 0-%u\n",
+			 env, RTE_MEMPOOL_CACHE_MAX_SIZE);
+	return size;
+}
+
 int
 init_mem(uint16_t portid, unsigned int nb_mbuf)
 {
@@ -972,15 +993,15 @@ init_mem(uint16_t portid, unsigned int nb_mbuf)
 				 portid, socketid);
 			pktmbuf_pool[portid][socketid] =
 				rte_pktmbuf_pool_create(s, nb_mbuf,
-					MEMPOOL_CACHE_SIZE, 0,
+					mempool_cache_size(), 0,
 					RTE_MBUF_DEFAULT_BUF_SIZE, socketid);
 			if (pktmbuf_pool[portid][socketid] == NULL)
 				rte_exit(EXIT_FAILURE,
 					"Cannot init mbuf pool on socket %d\n",
 					socketid);
 			else
-				printf("Allocated mbuf pool on socket %d\n",
-					socketid);
+				printf("Allocated mbuf pool on socket %d, cache %u per lcore\n",
+					socketid, mempool_cache_size());
 
 			/* Setup LPM, EM(f.e Hash) or FIB. But, only once per
 			 * available socket.
