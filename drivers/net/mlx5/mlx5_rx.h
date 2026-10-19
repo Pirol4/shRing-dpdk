@@ -163,7 +163,6 @@ struct mlx5_rxq_data {
 	int32_t *fill_pool; /* Credits no queue of the port holds (atomic). */
 	uint64_t fill_window_end; /* TSC at which the current window closes. */
 	uint64_t fill_window_tsc; /* Length of a window. */
-	int32_t fill_debt; /* Credits another queue asks back (atomic). */
 	uint32_t fill_rng; /* State of the generator that draws a loser. */
 	uint16_t fill_entitled; /* Credits no other queue can ask back. */
 	uint16_t fill_owed; /* Credits paid to a debt and still posted. */
@@ -189,6 +188,12 @@ struct mlx5_rxq_data {
 	// uint16_t consumed_strd;
 	// uint32_t rq_pi;
 	/* Buffer split segment descriptions - sizes, offsets, pools. */
+	/*
+	 * The one field other lcores write (a reclaim CASes it), alone on its
+	 * cache line: next to the fields this queue's lcore writes at every
+	 * burst, each reclaim would invalidate the line under the datapath.
+	 */
+	int32_t fill_debt __rte_cache_aligned; /* Credits another queue asks back (atomic). */
 } __rte_cache_aligned;
 
 enum mlx5_rxq_type {
