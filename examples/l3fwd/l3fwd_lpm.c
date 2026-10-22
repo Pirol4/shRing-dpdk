@@ -217,6 +217,10 @@ lpm_main_loop(__rte_unused void *dummy)
 
 			prev_tsc = cur_tsc;
 		}
+		if (unlikely(qconf->work.occ_period != 0 &&
+			     cur_tsc >= qconf->work.occ_next))
+			l3fwd_work_sample_occupancy(lcore_id, cur_tsc,
+						    qconf->rx_pkts);
 
 		/*
 		 * Read packet from RX queues
@@ -242,6 +246,7 @@ lpm_main_loop(__rte_unused void *dummy)
 				qconf->rx_cycles = (uint64_t) (qconf->rx_cycles + _diff_tsc);
 				qconf->rx_pkts += nb_rx;
 			}
+			l3fwd_work_do(&qconf->work, pkts_burst, nb_rx);
 
 #if defined RTE_ARCH_X86 || defined __ARM_NEON \
 			 || defined RTE_ARCH_PPC_64
@@ -261,6 +266,7 @@ lpm_main_loop(__rte_unused void *dummy)
 			qconf->tx_cycles = 0;
 			qconf->rx_pkts = 0;
 			qconf->fwd_cycles = 0;
+			l3fwd_work_reset(&qconf->work);
 			total_tsc = 0;
 			total_start_tsc = rte_rdtsc();
 			valid_measurements = true;
@@ -304,6 +310,7 @@ lpm_main_loop(__rte_unused void *dummy)
 	       qconf->rx_pkts ? (double)qconf->rx_cycles / qconf->rx_pkts : 0.0,
 	       qconf->rx_pkts ? (double)qconf->fwd_cycles / qconf->rx_pkts : 0.0,
 	       (uint64_t)(rte_get_tsc_hz() / 1E6));
+	l3fwd_work_report(lcore_id, qconf->rx_pkts);
 
 	return 0;
 }

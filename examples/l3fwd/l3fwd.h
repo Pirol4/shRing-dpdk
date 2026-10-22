@@ -8,6 +8,8 @@
 #include <rte_ethdev.h>
 #include <rte_vect.h>
 
+#include "l3fwd_work.h"
+
 #define DO_RFC_1812_CHECKS
 
 #define RTE_LOGTYPE_L3FWD RTE_LOGTYPE_USER1
@@ -83,6 +85,7 @@ struct lcore_conf {
 	uint64_t     lookup_cycles; /**< used for lookup processing */
 	uint64_t     rx_pkts; /**< packets received, same span as rx_cycles */
 	uint64_t     fwd_cycles; /**< non-empty Rx burst through send_packets */
+	struct l3fwd_work work; /**< synthetic work and occupancy (l3fwd_work.h) */
 #define NB_MEM_CALLS (256 * 256 * 16)
 #define NB_MEM_CALLS_MASK (NB_MEM_CALLS- 1)
 	uint64_t mem_calls[NB_MEM_CALLS];

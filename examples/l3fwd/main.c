@@ -1609,6 +1609,7 @@ main(int argc, char **argv)
 	check_all_ports_link_status(enabled_port_mask);
 
 	ret = 0;
+	l3fwd_work_init();
 	pool_ring_mark();
 	/* launch per-lcore init on every lcore */
 	rte_eal_mp_remote_launch(l3fwd_lkp.main_loop, NULL, CALL_MAIN);

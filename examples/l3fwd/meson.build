@@ -15,5 +15,6 @@ sources = files(
         'l3fwd_event_generic.c',
         'l3fwd_fib.c',
         'l3fwd_lpm.c',
+        'l3fwd_work.c',
         'main.c',
 )
