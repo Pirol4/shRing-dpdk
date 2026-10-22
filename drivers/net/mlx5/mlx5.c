@@ -183,10 +183,12 @@
  * Credits a pool keeps for queues below their entitlement: a queue growing
  * beyond fill_budget cannot take the last fill_reserve credits of a pool, so
  * a short backlog on another queue is served from the reserve instead of a
- * reclaim from the borrower.
+ * reclaim from the borrower. Off by default: on isolated cores there are no
+ * such backlogs to serve, and the reserve only caps a stalled borrower lower
+ * (cold stall 84 k lost with 64 against 66 k with 0, shUMEM CLAUDE.md 19.27).
  */
 #define MLX5_FILL_RESERVE "fill_reserve"
-#define MLX5_FILL_RESERVE_DEFAULT 64
+#define MLX5_FILL_RESERVE_DEFAULT 0
 
 /*
  * Device parameter to specify skew in nanoseconds on Tx datapath,
