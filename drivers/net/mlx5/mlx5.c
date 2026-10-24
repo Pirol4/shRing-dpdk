@@ -208,11 +208,14 @@
  * rises to its packet rate times this, up to its entitlement. In a ring of
  * 1024 the NIC drops in its internal buffer (rx_prio0_buf_discard) when
  * fewer WQEs are posted ahead than ~6-7 us of traffic: 64 B frames at line
- * rate need ~128 per queue, 1500 B frames ~7 (CLAUDE.md 20.12). 0 turns it
- * off, leaving the fixed fill_floor.
+ * rate need ~128 per queue, 1500 B frames ~7 (CLAUDE.md 20.12). The rate is
+ * what the queue receives, and while the NIC drops it reads low (~12 of 18.6
+ * Mpps at 64 B), so the default is set to reach 128 from there: 12 us; at
+ * 1500 B it still calls for ~12, under the floor of 32 (CLAUDE.md 20.15).
+ * 0 turns it off, leaving the fixed fill_floor.
  */
 #define MLX5_FILL_RUNWAY_NS "fill_runway_ns"
-#define MLX5_FILL_RUNWAY_NS_DEFAULT 7000
+#define MLX5_FILL_RUNWAY_NS_DEFAULT 12000
 #define MLX5_FILL_RUNWAY_NS_MAX 1000000
 
 /*
@@ -2208,7 +2211,7 @@ mlx5_fill_args_validate(struct mlx5_dev_config *config)
 	DRV_LOG(INFO, "FILL-ring Rx enabled with credits: each Rx queue is"
 		" entitled to %u buffers and keeps at least %u posted;"
 		" window %u ms, headroom %u%%; %u credit pool(s), reserve %u;"
-		" overload after %u ms without draining, runway %u ns (0: off)",
+		" overload after %u ms without an empty poll, runway %u ns (0: off)",
 		config->fill_budget, config->fill_floor,
 		config->fill_window_ms, config->fill_headroom,
 		config->fill_groups, config->fill_reserve,

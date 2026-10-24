@@ -1420,10 +1420,10 @@ mlx5_rxq_fill_rebudget(struct mlx5_rxq_data *rxq, bool saturated,
  * for a while, at a clock read (every 256 bursts).
  *
  * A stalled core drains its backlog within a millisecond or two of running
- * again, so some burst comes back short; an overloaded one never does. After
- * fill_overload_tsc without a short burst the queue shrinks to its floor and
+ * again and then polls an empty queue; an overloaded one never does. After
+ * fill_overload_tsc without an empty poll the queue shrinks to its floor and
  * borrows nothing, since buffers beyond a burst's worth cannot lower its
- * loss, only lengthen the queue its packets wait in. The first short burst
+ * loss, only lengthen the queue its packets wait in. The first empty poll
  * ends it, and the queue grows again from what it needs then, not from the
  * peaks the overload left behind.
  *
@@ -1571,7 +1571,14 @@ mlx5_rxq_fill_credits(struct mlx5_rxq_data *rxq, uint16_t nb_rx,
 		mlx5_rxq_fill_tick(rxq);
 	if (likely(nb_rx != pkts_n)) {
 		rxq->fill_full_run = 0;
-		rxq->fill_drained = 1;
+		/*
+		 * Drained means caught up: an empty poll. A short burst is not
+		 * enough: a saturated core held at its floor sees one now and
+		 * then, and leaving overload on it made the queue regrow and
+		 * shrink every few tens of ms (CLAUDE.md 20.15).
+		 */
+		if (nb_rx == 0)
+			rxq->fill_drained = 1;
 	} else {
 		if (rxq->fill_full_run++ % MLX5_FILL_RECOUNT == 0) {
 			/* A full burst may have left more behind. */
