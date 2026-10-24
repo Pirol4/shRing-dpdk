@@ -29,6 +29,8 @@
 #define MLX5_FILL_RECOUNT 8
 /* fill_overload_ms: full bursts in a row between two overload checks. */
 #define MLX5_FILL_OVERLOAD_CHECK 16
+/* fill_runway_ns: shortest span a queue's packet rate is measured over. */
+#define MLX5_FILL_RATE_MIN_US 1000
 
 struct mlx5_rxq_stats {
 #ifdef MLX5_PMD_SOFT_COUNTERS
@@ -180,6 +182,10 @@ struct mlx5_rxq_data {
 	uint8_t fill_overloaded; /* Its backlog has not drained for fill_overload_tsc. */
 	uint64_t fill_overload_tsc; /* No drain this long is overload; 0: off. */
 	uint64_t fill_busy_since; /* First clock read of the run without a drain. */
+	uint64_t fill_runway_tsc; /* Traffic kept posted at least, in TSC; 0: off. */
+	uint64_t fill_rate_tsc; /* Start of the current rate measurement. */
+	uint32_t fill_rate_pi; /* rq_pi at that start. */
+	uint16_t fill_rate_floor[2]; /* Floor the rate called for: last and current window. */
 	struct {
 		uint64_t budget_sum; /* Budget summed at every clock read. */
 		uint32_t samples; /* Clock reads, for the mean budget. */
@@ -189,6 +195,7 @@ struct mlx5_rxq_data {
 		uint32_t reclaims; /* Times it asked a borrower for credits. */
 		uint32_t paid; /* Credits it gave back when asked. */
 		uint32_t overloads; /* Times it was found overloaded. */
+		uint16_t rate_floor_max; /* Largest floor its packet rate called for. */
 		uint16_t budget_max; /* Largest budget held. */
 		uint16_t peak_max; /* Largest backlog seen. */
 	} fill_stats;

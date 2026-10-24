@@ -1331,6 +1331,21 @@ mlx5_rxq_fill_pay(struct mlx5_rxq_data *rxq)
 }
 
 /**
+ * The smallest budget a queue may have now: its fixed floor, or what its
+ * packet rate calls for over the last one to two windows (fill_runway_ns).
+ *
+ * @param rxq
+ *   Pointer to RX queue structure.
+ */
+static inline uint32_t
+mlx5_rxq_fill_floor_now(const struct mlx5_rxq_data *rxq)
+{
+	return RTE_MAX((uint32_t)rxq->fill_floor,
+		       (uint32_t)RTE_MAX(rxq->fill_rate_floor[0],
+					 rxq->fill_rate_floor[1]));
+}
+
+/**
  * Move the budget of a queue towards what its backlog calls for.
  *
  * @param rxq
@@ -1345,6 +1360,7 @@ mlx5_rxq_fill_rebudget(struct mlx5_rxq_data *rxq, bool saturated,
 		       bool may_shrink)
 {
 	const uint32_t ring = 1 << rxq->elts_n;
+	const uint32_t floor = mlx5_rxq_fill_floor_now(rxq);
 	const uint32_t peak = RTE_MAX(rxq->fill_peak[0], rxq->fill_peak[1]);
 	uint32_t target = peak * rxq->fill_headroom / 100;
 	uint16_t budget = rxq->fill_budget;
@@ -1352,10 +1368,10 @@ mlx5_rxq_fill_rebudget(struct mlx5_rxq_data *rxq, bool saturated,
 	rxq->fill_short = 0;
 	if (saturated)
 		target = RTE_MAX(target, 2u * budget);
-	target = RTE_MIN(RTE_MAX(target, (uint32_t)rxq->fill_floor), ring);
+	target = RTE_MIN(RTE_MAX(target, floor), ring);
 	/* Overloaded: more buffers would only hold its packets longer. */
 	if (rxq->fill_overloaded)
-		target = rxq->fill_floor;
+		target = floor;
 	if (target > budget) {
 		uint16_t want = target - budget;
 		/*
@@ -1444,6 +1460,47 @@ mlx5_rxq_fill_overload(struct mlx5_rxq_data *rxq, uint64_t now)
 }
 
 /**
+ * Measure a queue's packet rate and raise its floor to fill_runway_ns of it.
+ *
+ * The NIC needs a margin of posted WQEs ahead of its packets that is a time,
+ * not a count: in a ring of 1024 it drops in its internal buffer when fewer
+ * than ~6-7 us of traffic are posted (CLAUDE.md 20.12). The rate is taken
+ * over at least MLX5_FILL_RATE_MIN_US, from rq_pi (WQEs consumed), so the
+ * datapath pays nothing; the floor it calls for rises at once and, like a
+ * peak backlog, is remembered for one to two windows. It never exceeds the
+ * entitlement: what is beyond it is borrowed and could be asked back.
+ *
+ * @param rxq
+ *   Pointer to RX queue structure.
+ * @param now
+ *   TSC of this clock read.
+ */
+static void
+mlx5_rxq_fill_runway(struct mlx5_rxq_data *rxq, uint64_t now)
+{
+	const uint64_t span = now - rxq->fill_rate_tsc;
+	const uint32_t pkts = rxq->rq_pi - rxq->fill_rate_pi;
+	uint64_t floor;
+
+	if (rxq->fill_rate_tsc != 0 &&
+	    span < rte_get_tsc_hz() / 1000000 * MLX5_FILL_RATE_MIN_US)
+		return;
+	rxq->fill_rate_tsc = now;
+	rxq->fill_rate_pi = rxq->rq_pi;
+	if (span == now)	/* the first measurement starts here */
+		return;
+	floor = RTE_MIN((uint64_t)pkts * rxq->fill_runway_tsc / span,
+			(uint64_t)rxq->fill_entitled);
+	if (floor <= rxq->fill_rate_floor[1])
+		return;
+	rxq->fill_rate_floor[1] = floor;
+	if (floor > rxq->fill_stats.rate_floor_max)
+		rxq->fill_stats.rate_floor_max = floor;
+	if (floor > rxq->fill_budget)
+		mlx5_rxq_fill_rebudget(rxq, false, false);
+}
+
+/**
  * Close a window if its time is up: forget the older peak and let the budget
  * come down to what the last window needed.
  *
@@ -1457,6 +1514,8 @@ mlx5_rxq_fill_tick(struct mlx5_rxq_data *rxq)
 
 	rxq->fill_stats.budget_sum += rxq->fill_budget;
 	++rxq->fill_stats.samples;
+	if (rxq->fill_runway_tsc != 0)
+		mlx5_rxq_fill_runway(rxq, now);
 	if (rxq->fill_overload_tsc != 0)
 		mlx5_rxq_fill_overload(rxq, now);
 	if (now < rxq->fill_window_end) {
@@ -1471,6 +1530,8 @@ mlx5_rxq_fill_tick(struct mlx5_rxq_data *rxq)
 	rxq->fill_window_end = now + rxq->fill_window_tsc;
 	rxq->fill_peak[0] = rxq->fill_peak[1];
 	rxq->fill_peak[1] = 0;
+	rxq->fill_rate_floor[0] = rxq->fill_rate_floor[1];
+	rxq->fill_rate_floor[1] = 0;
 	mlx5_rxq_fill_rebudget(rxq, false, true);
 }
 
@@ -1558,7 +1619,7 @@ mlx5_rxq_fill_stats_log(const struct mlx5_rxq_data *rxq)
 	DRV_LOG(INFO, "port %u Rx queue %u: FILL credits: budget %u now,"
 		" %" PRIu64 " mean, %u max (floor %u); peak backlog %u;"
 		" %u grows, %u shrinks, %u denied, %u reclaims, %u paid;"
-		" pool %d; %u overloads",
+		" pool %d; %u overloads; rate floor %u now, %u max",
 		rxq->port_id, rxq->idx, rxq->fill_budget,
 		rxq->fill_stats.budget_sum / rxq->fill_stats.samples,
 		rxq->fill_stats.budget_max, rxq->fill_floor,
@@ -1566,7 +1627,8 @@ mlx5_rxq_fill_stats_log(const struct mlx5_rxq_data *rxq)
 		rxq->fill_stats.shrinks, rxq->fill_stats.denied,
 		rxq->fill_stats.reclaims, rxq->fill_stats.paid,
 		__atomic_load_n(rxq->fill_pool, __ATOMIC_RELAXED),
-		rxq->fill_stats.overloads);
+		rxq->fill_stats.overloads, mlx5_rxq_fill_floor_now(rxq),
+		rxq->fill_stats.rate_floor_max);
 }
 
 /**

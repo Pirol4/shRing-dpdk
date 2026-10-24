@@ -288,6 +288,9 @@ struct mlx5_dev_config {
 	uint32_t fill_reserve; /* Credits only a queue below its entitlement takes. */
 	int fill_reserve_set; /* fill_reserve was given (0 is a valid value). */
 	uint32_t fill_overload_ms; /* No drain this long is overload (0: off). */
+	int fill_overload_set; /* fill_overload_ms was given (0 is valid). */
+	uint32_t fill_runway_ns; /* Traffic a queue keeps posted at least (0: off). */
+	int fill_runway_set; /* fill_runway_ns was given (0 is valid). */
 };
 
 
