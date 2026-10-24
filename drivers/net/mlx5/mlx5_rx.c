@@ -1511,9 +1511,20 @@ mlx5_rxq_fill_credits(struct mlx5_rxq_data *rxq, uint16_t nb_rx,
 	if (likely(nb_rx != pkts_n)) {
 		rxq->fill_full_run = 0;
 		rxq->fill_drained = 1;
-	} else if (rxq->fill_full_run++ % MLX5_FILL_RECOUNT == 0) {
-		/* A full burst may have left more behind. */
-		backlog += mlx5_rxq_fill_pending(rxq, posted);
+	} else {
+		if (rxq->fill_full_run++ % MLX5_FILL_RECOUNT == 0) {
+			/* A full burst may have left more behind. */
+			backlog += mlx5_rxq_fill_pending(rxq, posted);
+		}
+		/*
+		 * A queue that stays behind is checked for overload every
+		 * MLX5_FILL_OVERLOAD_CHECK full bursts, not only at the clock
+		 * read every 256 bursts: a slow core's bursts take long, and
+		 * meanwhile the queue would grow to the whole pool.
+		 */
+		if (unlikely(rxq->fill_overload_tsc != 0 &&
+			     rxq->fill_full_run % MLX5_FILL_OVERLOAD_CHECK == 0))
+			mlx5_rxq_fill_overload(rxq, rte_rdtsc());
 	}
 	saturated = backlog >= posted_before;
 	if (backlog > rxq->fill_stats.peak_max)

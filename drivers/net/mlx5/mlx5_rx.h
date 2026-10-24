@@ -27,6 +27,8 @@
 /* FILL-ring credits (fill_dyn): see mlx5_rxq_fill_credits(). */
 /* While bursts keep coming back full, count the backlog every this many. */
 #define MLX5_FILL_RECOUNT 8
+/* fill_overload_ms: full bursts in a row between two overload checks. */
+#define MLX5_FILL_OVERLOAD_CHECK 16
 
 struct mlx5_rxq_stats {
 #ifdef MLX5_PMD_SOFT_COUNTERS
