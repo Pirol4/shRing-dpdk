@@ -174,6 +174,10 @@ struct mlx5_rxq_data {
 	uint16_t fill_peak[2]; /* Largest backlog: last and current window. */
 	uint8_t fill_polls; /* Bursts since the clock was last read. */
 	uint8_t fill_full_run; /* Consecutive bursts that came back full. */
+	uint8_t fill_drained; /* A burst came back short since the clock was read. */
+	uint8_t fill_overloaded; /* Its backlog has not drained for fill_overload_tsc. */
+	uint64_t fill_overload_tsc; /* No drain this long is overload; 0: off. */
+	uint64_t fill_busy_since; /* First clock read of the run without a drain. */
 	struct {
 		uint64_t budget_sum; /* Budget summed at every clock read. */
 		uint32_t samples; /* Clock reads, for the mean budget. */
@@ -182,6 +186,7 @@ struct mlx5_rxq_data {
 		uint32_t denied; /* Raises cut short by an empty pool. */
 		uint32_t reclaims; /* Times it asked a borrower for credits. */
 		uint32_t paid; /* Credits it gave back when asked. */
+		uint32_t overloads; /* Times it was found overloaded. */
 		uint16_t budget_max; /* Largest budget held. */
 		uint16_t peak_max; /* Largest backlog seen. */
 	} fill_stats;

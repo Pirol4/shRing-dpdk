@@ -191,6 +191,16 @@
 #define MLX5_FILL_RESERVE_DEFAULT 0
 
 /*
+ * Milliseconds a fill_dyn queue may go without its backlog draining once
+ * before it counts as overloaded: its core runs but slower than its traffic,
+ * so buffers beyond a burst's worth only make packets wait longer, they do
+ * not cut its loss. An overloaded queue shrinks to its floor and borrows
+ * nothing until it drains again. 0 (the default) keeps the policy without it.
+ */
+#define MLX5_FILL_OVERLOAD_MS "fill_overload_ms"
+#define MLX5_FILL_OVERLOAD_MS_MAX 60000
+
+/*
  * Device parameter to specify skew in nanoseconds on Tx datapath,
  * it represents the time between SQ start WQE processing and
  * appearing actual packet data on the wire.
@@ -1942,6 +1952,8 @@ mlx5_args_check(const char *key, const char *val, void *opaque)
 	} else if (strcmp(MLX5_FILL_RESERVE, key) == 0) {
 		config->fill_reserve = tmp;
 		config->fill_reserve_set = 1;
+	} else if (strcmp(MLX5_FILL_OVERLOAD_MS, key) == 0) {
+		config->fill_overload_ms = tmp;
 	} else if (strcmp(MLX5_RXQ_PKT_PAD_EN, key) == 0) {
 		config->hw_padding = !!tmp;
 	} else if (strcmp(MLX5_RX_MPRQ_EN, key) == 0) {
@@ -2077,9 +2089,10 @@ mlx5_fill_args_validate(struct mlx5_dev_config *config)
 	}
 	if (!config->fill_dyn &&
 	    (config->fill_window_ms != 0 || config->fill_headroom != 0 ||
-	     config->fill_groups != 0 || config->fill_reserve_set)) {
-		DRV_LOG(ERR, "fill_window_ms, fill_headroom, fill_groups and"
-			     " fill_reserve require fill_dyn");
+	     config->fill_groups != 0 || config->fill_reserve_set ||
+	     config->fill_overload_ms != 0)) {
+		DRV_LOG(ERR, "fill_window_ms, fill_headroom, fill_groups,"
+			     " fill_reserve and fill_overload_ms require fill_dyn");
 		rte_errno = EINVAL;
 		return -rte_errno;
 	}
@@ -2156,12 +2169,20 @@ mlx5_fill_args_validate(struct mlx5_dev_config *config)
 		rte_errno = EINVAL;
 		return -rte_errno;
 	}
+	if (config->fill_overload_ms > MLX5_FILL_OVERLOAD_MS_MAX) {
+		DRV_LOG(ERR, "fill_overload_ms must be at most %u",
+			MLX5_FILL_OVERLOAD_MS_MAX);
+		rte_errno = EINVAL;
+		return -rte_errno;
+	}
 	DRV_LOG(INFO, "FILL-ring Rx enabled with credits: each Rx queue is"
 		" entitled to %u buffers and keeps at least %u posted;"
-		" window %u ms, headroom %u%%; %u credit pool(s), reserve %u",
+		" window %u ms, headroom %u%%; %u credit pool(s), reserve %u;"
+		" overload after %u ms without draining (0: off)",
 		config->fill_budget, config->fill_floor,
 		config->fill_window_ms, config->fill_headroom,
-		config->fill_groups, config->fill_reserve);
+		config->fill_groups, config->fill_reserve,
+		config->fill_overload_ms);
 	return 0;
 }
 
@@ -2227,6 +2248,7 @@ mlx5_args(struct mlx5_dev_config *config, struct rte_devargs *devargs)
 		MLX5_FILL_HEADROOM,
 		MLX5_FILL_GROUPS,
 		MLX5_FILL_RESERVE,
+		MLX5_FILL_OVERLOAD_MS,
 		NULL,
 	};
 	struct rte_kvargs *kvlist;

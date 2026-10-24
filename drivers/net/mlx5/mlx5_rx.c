@@ -1353,6 +1353,9 @@ mlx5_rxq_fill_rebudget(struct mlx5_rxq_data *rxq, bool saturated,
 	if (saturated)
 		target = RTE_MAX(target, 2u * budget);
 	target = RTE_MIN(RTE_MAX(target, (uint32_t)rxq->fill_floor), ring);
+	/* Overloaded: more buffers would only hold its packets longer. */
+	if (rxq->fill_overloaded)
+		target = rxq->fill_floor;
 	if (target > budget) {
 		uint16_t want = target - budget;
 		/*
@@ -1397,6 +1400,50 @@ mlx5_rxq_fill_rebudget(struct mlx5_rxq_data *rxq, bool saturated,
 }
 
 /**
+ * Tell a queue whose core is slower than its traffic from one that is behind
+ * for a while, at a clock read (every 256 bursts).
+ *
+ * A stalled core drains its backlog within a millisecond or two of running
+ * again, so some burst comes back short; an overloaded one never does. After
+ * fill_overload_tsc without a short burst the queue shrinks to its floor and
+ * borrows nothing, since buffers beyond a burst's worth cannot lower its
+ * loss, only lengthen the queue its packets wait in. The first short burst
+ * ends it, and the queue grows again from what it needs then, not from the
+ * peaks the overload left behind.
+ *
+ * @param rxq
+ *   Pointer to RX queue structure.
+ * @param now
+ *   TSC of this clock read.
+ */
+static void
+mlx5_rxq_fill_overload(struct mlx5_rxq_data *rxq, uint64_t now)
+{
+	const bool drained = rxq->fill_drained;
+
+	rxq->fill_drained = 0;
+	if (drained) {
+		rxq->fill_busy_since = 0;
+		if (rxq->fill_overloaded) {
+			rxq->fill_overloaded = 0;
+			rxq->fill_peak[0] = 0;
+			rxq->fill_peak[1] = 0;
+		}
+		return;
+	}
+	if (rxq->fill_busy_since == 0) {
+		rxq->fill_busy_since = now;
+		return;
+	}
+	if (rxq->fill_overloaded ||
+	    now - rxq->fill_busy_since < rxq->fill_overload_tsc)
+		return;
+	rxq->fill_overloaded = 1;
+	++rxq->fill_stats.overloads;
+	mlx5_rxq_fill_rebudget(rxq, false, true);
+}
+
+/**
  * Close a window if its time is up: forget the older peak and let the budget
  * come down to what the last window needed.
  *
@@ -1410,6 +1457,8 @@ mlx5_rxq_fill_tick(struct mlx5_rxq_data *rxq)
 
 	rxq->fill_stats.budget_sum += rxq->fill_budget;
 	++rxq->fill_stats.samples;
+	if (rxq->fill_overload_tsc != 0)
+		mlx5_rxq_fill_overload(rxq, now);
 	if (now < rxq->fill_window_end) {
 		/*
 		 * Short of its own credits: what it asked back may be in the
@@ -1461,6 +1510,7 @@ mlx5_rxq_fill_credits(struct mlx5_rxq_data *rxq, uint16_t nb_rx,
 		mlx5_rxq_fill_tick(rxq);
 	if (likely(nb_rx != pkts_n)) {
 		rxq->fill_full_run = 0;
+		rxq->fill_drained = 1;
 	} else if (rxq->fill_full_run++ % MLX5_FILL_RECOUNT == 0) {
 		/* A full burst may have left more behind. */
 		backlog += mlx5_rxq_fill_pending(rxq, posted);
@@ -1497,14 +1547,15 @@ mlx5_rxq_fill_stats_log(const struct mlx5_rxq_data *rxq)
 	DRV_LOG(INFO, "port %u Rx queue %u: FILL credits: budget %u now,"
 		" %" PRIu64 " mean, %u max (floor %u); peak backlog %u;"
 		" %u grows, %u shrinks, %u denied, %u reclaims, %u paid;"
-		" pool %d",
+		" pool %d; %u overloads",
 		rxq->port_id, rxq->idx, rxq->fill_budget,
 		rxq->fill_stats.budget_sum / rxq->fill_stats.samples,
 		rxq->fill_stats.budget_max, rxq->fill_floor,
 		rxq->fill_stats.peak_max, rxq->fill_stats.grows,
 		rxq->fill_stats.shrinks, rxq->fill_stats.denied,
 		rxq->fill_stats.reclaims, rxq->fill_stats.paid,
-		__atomic_load_n(rxq->fill_pool, __ATOMIC_RELAXED));
+		__atomic_load_n(rxq->fill_pool, __ATOMIC_RELAXED),
+		rxq->fill_stats.overloads);
 }
 
 /**

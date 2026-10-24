@@ -287,6 +287,7 @@ struct mlx5_dev_config {
 	uint32_t fill_groups; /* fill_dyn credit pools, one per group of queues. */
 	uint32_t fill_reserve; /* Credits only a queue below its entitlement takes. */
 	int fill_reserve_set; /* fill_reserve was given (0 is a valid value). */
+	uint32_t fill_overload_ms; /* No drain this long is overload (0: off). */
 };
 
 
