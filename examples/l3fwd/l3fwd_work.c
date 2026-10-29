@@ -3,6 +3,7 @@
  */
 
 #include <inttypes.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -40,29 +41,45 @@ env_number(const char *name, unsigned long fallback, unsigned long max)
 	return value;
 }
 
-/* L3FWD_WORK_TARGET=<lcore>:<accesses>; *lcore = RTE_MAX_LCORE when unset. */
-static void
-env_target(unsigned int *lcore, uint32_t *accesses)
+/*
+ * L3FWD_WORK_TARGET=<lcore>[,<lcore>...]:<accesses>: those lcores do
+ * <accesses> instead of L3FWD_WORK_ACCESSES. Several lcores give one target
+ * per port, as the rxBisect paper's "one target core per NIC". Marks them in
+ * `is_target` and returns how many there are (0 when unset).
+ */
+static unsigned int
+env_target(bool is_target[RTE_MAX_LCORE], uint32_t *accesses)
 {
 	const char *env = getenv("L3FWD_WORK_TARGET");
+	const char *p = env;
 	unsigned long id, n;
+	unsigned int count = 0;
 	char *end;
 
-	*lcore = RTE_MAX_LCORE;
+	memset(is_target, 0, sizeof(bool) * RTE_MAX_LCORE);
 	*accesses = 0;
 	if (env == NULL || *env == '\0')
-		return;
-	id = strtoul(env, &end, 10);
-	if (*end != ':' || id >= RTE_MAX_LCORE)
+		return 0;
+	for (;;) {
+		id = strtoul(p, &end, 10);
+		if (end == p || id >= RTE_MAX_LCORE ||
+		    (*end != ',' && *end != ':'))
+			goto bad;
+		if (!is_target[id])
+			count++;
+		is_target[id] = true;
+		p = end + 1;
+		if (*end == ':')
+			break;
+	}
+	n = strtoul(p, &end, 10);
+	if (end == p || *end != '\0' || n > WORK_ACCESSES_MAX)
 		goto bad;
-	n = strtoul(end + 1, &end, 10);
-	if (*end != '\0' || n > WORK_ACCESSES_MAX)
-		goto bad;
-	*lcore = id;
 	*accesses = n;
-	return;
+	return count;
 bad:
-	rte_exit(EXIT_FAILURE, "L3FWD_WORK_TARGET=%s: want <lcore>:<0-%u>\n",
+	rte_exit(EXIT_FAILURE,
+		 "L3FWD_WORK_TARGET=%s: want <lcore>[,<lcore>...]:<0-%u>\n",
 		 env, WORK_ACCESSES_MAX);
 }
 
@@ -85,15 +102,16 @@ work_buffer_alloc(unsigned long mib)
 void
 l3fwd_work_init(void)
 {
+	static bool is_target[RTE_MAX_LCORE];
 	unsigned long accesses, mib, occupancy_us;
-	unsigned int target_lcore, lcore_id;
+	unsigned int targets, lcore_id;
 	uint32_t target_accesses;
 
 	accesses = env_number("L3FWD_WORK_ACCESSES", 0, WORK_ACCESSES_MAX);
 	mib = env_number("L3FWD_WORK_MIB", WORK_MIB_DEFAULT, WORK_MIB_MAX);
 	l3fwd_work_payload = env_number("L3FWD_WORK_PAYLOAD", 0, 1);
 	occupancy_us = env_number("L3FWD_OCCUPANCY_US", 0, OCCUPANCY_US_MAX);
-	env_target(&target_lcore, &target_accesses);
+	targets = env_target(is_target, &target_accesses);
 	if (mib == 0)
 		rte_exit(EXIT_FAILURE, "L3FWD_WORK_MIB must be at least 1\n");
 
@@ -104,14 +122,18 @@ l3fwd_work_init(void)
 		struct l3fwd_work *w = &lcore_conf[lcore_id].work;
 
 		memset(w, 0, sizeof(*w));
-		w->accesses = lcore_id == target_lcore ? target_accesses
-						       : accesses;
+		w->accesses = is_target[lcore_id] ? target_accesses : accesses;
 		w->rng = 0x2545f4914f6cdd1dULL * (lcore_id + 1);
 		w->occ_period = occupancy_us * rte_get_tsc_hz() / US_PER_S;
 	}
 	printf("WORK: %lu random reads per packet in %lu MiB", accesses, mib);
-	if (target_lcore < RTE_MAX_LCORE)
-		printf(", %u on target lcore %u", target_accesses, target_lcore);
+	if (targets > 0) {
+		printf(", %u on target lcore%s", target_accesses,
+		       targets > 1 ? "s" : "");
+		for (lcore_id = 0; lcore_id < RTE_MAX_LCORE; lcore_id++)
+			if (is_target[lcore_id])
+				printf(" %u", lcore_id);
+	}
 	printf("; payload read %s; occupancy every %lu us%s\n",
 	       l3fwd_work_payload ? "on" : "off", occupancy_us,
 	       occupancy_us ? "" : " (off)");

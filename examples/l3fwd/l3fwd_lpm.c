@@ -148,6 +148,8 @@ static void get_stats(struct lcore_conf *qconf) {
 	xstats = (struct rte_eth_xstat *)
 		malloc(sizeof(struct rte_eth_xstat) * len);
 	rte_eth_xstats_get(port_id, xstats, len);
+	/* With two ports, tells whose counters follow (shUMEM sweep.sh). */
+	printf("XSTATS port %d lcore %u:\n", port_id, rte_lcore_id());
 	for (int i = 0; i < len; i++) {
 		printf("%s [%lu] = %ld\n", names[i].name,
 					 xstats[i].id,

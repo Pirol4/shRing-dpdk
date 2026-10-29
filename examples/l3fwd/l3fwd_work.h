@@ -20,7 +20,8 @@
  *
  * Environment (read once at start-up):
  *   L3FWD_WORK_ACCESSES=N         random reads per packet on every lcore
- *   L3FWD_WORK_TARGET=<lcore>:<N> that lcore does N instead
+ *   L3FWD_WORK_TARGET=<lcore>[,<lcore>...]:<N> those lcores do N instead
+ *                                (one target per port, as rxBisect's per NIC)
  *   L3FWD_WORK_MIB=M              buffer size in MiB (default 40)
  *   L3FWD_WORK_PAYLOAD=1          also read the payload of every packet
  *   L3FWD_OCCUPANCY_US=U          occupancy sample period (0, default: off)
